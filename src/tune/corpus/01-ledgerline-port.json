@@ -1,0 +1,26 @@
+{
+  "id": "ledgerline-port",
+  "split": "dev",
+  "messages": [
+    { "kind": "user", "text": "The ledgerline service fails to start on the staging box. Check /srv/ledgerline/config/app.toml, I think the port is 8081." },
+    { "kind": "piroboros", "text": "I will read the config and the start log first." },
+    { "kind": "tool", "text": "read /srv/ledgerline/config/app.toml" },
+    { "kind": "echo", "text": "[server] port = 8081 host = 0.0.0.0 [db] host = db-stg port = 5432 name = ledger pool = 12" },
+    { "kind": "tool", "text": "bash: journalctl -u ledgerline -n 20" },
+    { "kind": "echo", "text": "ledgerline[2210]: fatal E_BIND 98: address already in use 0.0.0.0:8081 (held by pid 1873, nginx-proxy). ledgerline[2210]: exiting with status 3" },
+    { "kind": "piroboros", "text": "Port 8081 is taken by the nginx-proxy process 1873, so ledgerline cannot bind. I propose moving ledgerline to another port." },
+    { "kind": "user", "text": "Use 8093 instead of 8081, and keep the pool at 12. Do not touch nginx." },
+    { "kind": "tool", "text": "edit /srv/ledgerline/config/app.toml: port 8081 -> 8093" },
+    { "kind": "echo", "text": "edited 1 line" },
+    { "kind": "tool", "text": "bash: systemctl restart ledgerline" },
+    { "kind": "echo", "text": "active (running) since 14:02, listening on 0.0.0.0:8093, release v2.7.4" },
+    { "kind": "piroboros", "text": "ledgerline now runs on 8093 with the pool still at 12. nginx was not touched." }
+  ],
+  "probes": [
+    { "type": "keep", "at": 3, "text": "pool = 12" },
+    { "type": "keep", "at": 5, "text": "E_BIND 98" },
+    { "type": "keep", "at": 6, "text": "1873" },
+    { "type": "keep", "at": 11, "text": "v2.7.4" },
+    { "type": "correction", "at": 0, "old": "8081", "fix": 7, "new": "8093" }
+  ]
+}

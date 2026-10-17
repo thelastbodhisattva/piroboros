@@ -1,0 +1,26 @@
+{
+  "id": "pinewood-sidebar",
+  "split": "dev",
+  "messages": [
+    { "kind": "user", "text": "In pinewood the sidebar width should be 240px. Edit styles/layout.css." },
+    { "kind": "piroboros", "text": "Reading styles/layout.css and the breakpoint file." },
+    { "kind": "tool", "text": "read styles/layout.css" },
+    { "kind": "echo", "text": ".sidebar { width: 280px; } .main { margin-left: 280px; } @media (max-width: 720px) { .sidebar { display: none; } }" },
+    { "kind": "piroboros", "text": "Both .sidebar and .main use 280px. I will change both to 240px to keep them aligned." },
+    { "kind": "tool", "text": "edit styles/layout.css: 280px -> 240px (2 places)" },
+    { "kind": "echo", "text": "2 replacements" },
+    { "kind": "user", "text": "Wait, the designers sent a mockup. Make it 256px, and the mobile breakpoint 768px." },
+    { "kind": "tool", "text": "edit styles/layout.css: 240px -> 256px, 720px -> 768px" },
+    { "kind": "echo", "text": "3 replacements" },
+    { "kind": "tool", "text": "bash: npx playwright test sidebar" },
+    { "kind": "echo", "text": "sidebar.spec.ts: 4 passed; snapshot sidebar-collapsed.png updated (run id pw-5521)" },
+    { "kind": "piroboros", "text": "The sidebar is 256px, the mobile breakpoint is 768px, and 4 Playwright tests pass." }
+  ],
+  "probes": [
+    { "type": "keep", "at": 0, "text": "styles/layout.css" },
+    { "type": "keep", "at": 11, "text": "pw-5521" },
+    { "type": "keep", "at": 11, "text": "sidebar-collapsed.png" },
+    { "type": "correction", "at": 0, "old": "240px", "fix": 7, "new": "256px" },
+    { "type": "correction", "at": 3, "old": "720px", "fix": 7, "new": "768px" }
+  ]
+}

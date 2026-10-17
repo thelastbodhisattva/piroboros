@@ -1,0 +1,28 @@
+{
+  "thinking": "medium",
+  "compactor": {
+    "enabled": true,
+    "model": "example-llm/example-chat",
+    "thinking": "off",
+    "maxConcurrent": 8,
+    "allowThirdParty": false
+  },
+  "conclave": {
+    "defaultModel": "example-llm/example-chat",
+    "maxTurns": 64,
+    "idleTimeoutMs": 600000,
+    "reportMaxChars": 4000,
+    "members": {
+      "samaela": { "model": "example-claude/example-reasoner", "thinking": "high" },
+      "vesperia": { "maxTurns": 256 }
+    }
+  },
+  "gateTimeoutMs": 120000,
+  "cacheRetention": "short",
+  "shellEnvAllow": [],
+  "shellTimeoutMs": 600000,
+  "guard": { "deny": [] },
+  "planning": true,
+  "web": { "enabled": false, "maxFetches": 10, "maxSearches": 5, "search": { "provider": "tinyfish" }, "allowHosts": [], "queryHosts": [] },
+  "tui": { "thinkingSteps": "summary" }
+}

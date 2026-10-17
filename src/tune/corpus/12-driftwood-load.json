@@ -1,0 +1,30 @@
+{
+  "id": "driftwood-load",
+  "split": "heldout",
+  "messages": [
+    { "kind": "user", "text": "driftwood-etl should write into the table events_raw. The warehouse is wh-prod-3, schema analytics." },
+    { "kind": "piroboros", "text": "I will check the sink config in conf/sink.yaml." },
+    { "kind": "tool", "text": "read conf/sink.yaml" },
+    { "kind": "echo", "text": "sink: type jdbc, url jdbc:postgresql://wh-prod-3:5432/warehouse, table: events_staging, batch: 5000, on_conflict: ignore" },
+    { "kind": "piroboros", "text": "The sink writes to events_staging today. I will point it to events_raw in schema analytics." },
+    { "kind": "tool", "text": "edit conf/sink.yaml: table analytics.events_raw" },
+    { "kind": "echo", "text": "ok" },
+    { "kind": "user", "text": "Hold on, the table is named events_landing in the real schema. events_raw was the old plan. Use analytics.events_landing and set batch to 10000." },
+    { "kind": "tool", "text": "edit conf/sink.yaml: table analytics.events_landing; batch 10000" },
+    { "kind": "echo", "text": "ok" },
+    { "kind": "tool", "text": "bash: driftwood run --dry --limit 50000" },
+    { "kind": "echo", "text": "dry run: 50,000 rows read, 5 batches planned, target analytics.events_landing, 0 errors" },
+    { "kind": "piroboros", "text": "The dry run plans 5 batches of 10000 to analytics.events_landing with no errors." },
+    { "kind": "user", "text": "Good. Run the real load for 2026-10-14 only." },
+    { "kind": "tool", "text": "bash: driftwood run --date 2026-10-14" },
+    { "kind": "echo", "text": "loaded 1,284,310 rows in 126 s, run id dw-77031" }
+  ],
+  "probes": [
+    { "type": "keep", "at": 0, "text": "wh-prod-3" },
+    { "type": "keep", "at": 13, "text": "2026-10-14" },
+    { "type": "keep", "at": 15, "text": "dw-77031" },
+    { "type": "keep", "at": 15, "text": "1,284,310" },
+    { "type": "correction", "at": 0, "old": "events_raw", "fix": 7, "new": "events_landing" },
+    { "type": "correction", "at": 3, "old": "5000", "fix": 7, "new": "10000" }
+  ]
+}

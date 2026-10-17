@@ -1,0 +1,28 @@
+{
+  "id": "brackenfield-import",
+  "split": "dev",
+  "messages": [
+    { "kind": "user", "text": "The brackenfield nightly import must finish by 04:00. It runs from 01:00 and ends near 05:10. Target the slow stage." },
+    { "kind": "piroboros", "text": "I will read the stage timings from the last run report." },
+    { "kind": "tool", "text": "read reports/import-2026-10-14.json" },
+    { "kind": "echo", "text": "stages: fetch 6 min, parse 41 min, dedupe 118 min, load 97 min, total 262 min; dedupe uses a full self-join on customer_ref" },
+    { "kind": "piroboros", "text": "Dedupe dominates. An index on customer_ref plus hashing would cut it, and load can follow later." },
+    { "kind": "user", "text": "Only dedupe for now. Use a hash set in memory, the box has 64 GB. Do not add a database index, the DBA said no." },
+    { "kind": "tool", "text": "edit pipeline/dedupe.py: replace the self-join with a set of customer_ref hashes" },
+    { "kind": "echo", "text": "diff: +34 -61" },
+    { "kind": "tool", "text": "bash: python -m pipeline.dedupe --sample 2000000 --time" },
+    { "kind": "echo", "text": "dedupe 2,000,000 rows in 11.8 s; peak rss 1.9 GB; duplicates found 14,206" },
+    { "kind": "user", "text": "Good. The deadline also moved: it must finish by 03:30, not 04:00." },
+    { "kind": "piroboros", "text": "Projected full run: dedupe takes about 9 min instead of 118, total near 153 min. That ends around 03:33, 3 minutes late." },
+    { "kind": "user", "text": "Then start it at 00:50." },
+    { "kind": "piroboros", "text": "The start time moves to 00:50 in cron as 50 0 * * *, so the projected end is 03:23." }
+  ],
+  "probes": [
+    { "type": "keep", "at": 3, "text": "customer_ref" },
+    { "type": "keep", "at": 5, "text": "64 GB" },
+    { "type": "keep", "at": 9, "text": "14,206" },
+    { "type": "keep", "at": 13, "text": "50 0 * * *" },
+    { "type": "correction", "at": 0, "old": "04:00", "fix": 10, "new": "03:30" },
+    { "type": "correction", "at": 0, "old": "01:00", "fix": 12, "new": "00:50" }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "id": "mossgate-node",
+  "split": "heldout",
+  "messages": [
+    { "kind": "user", "text": "Upgrade mossgate from Node 20 to Node 22 in CI. The workflow is .ci/build.yml. Pin the image to node:22.4." },
+    { "kind": "piroboros", "text": "Reading the workflow and the Dockerfile." },
+    { "kind": "tool", "text": "read .ci/build.yml" },
+    { "kind": "echo", "text": "image: node:20.11-bookworm; steps: install, lint, test, publish; cache keyed on a hash of package-lock.json" },
+    { "kind": "tool", "text": "read Dockerfile" },
+    { "kind": "echo", "text": "FROM node:20.11-slim AS runtime; RUN npm ci --omit=dev" },
+    { "kind": "piroboros", "text": "I will change the CI image to node:22.4-bookworm and the Dockerfile base to node:22.4-slim." },
+    { "kind": "user", "text": "Use 22.9 instead of 22.4, because 22.4 has a known regression in fetch. Dockerfile too." },
+    { "kind": "tool", "text": "edit .ci/build.yml: image node:22.9-bookworm; edit Dockerfile: FROM node:22.9-slim" },
+    { "kind": "echo", "text": "2 files changed" },
+    { "kind": "tool", "text": "bash: act -j test" },
+    { "kind": "echo", "text": "lint ok; test: 2 failed (ERR_REQUIRE_ESM in tests/legacy/report.cjs), 140 passed" },
+    { "kind": "piroboros", "text": "Two tests fail with ERR_REQUIRE_ESM in tests/legacy/report.cjs. I will convert the require to a dynamic import." },
+    { "kind": "user", "text": "Do that, but leave the other .cjs files alone." },
+    { "kind": "tool", "text": "edit tests/legacy/report.cjs: use await import()" },
+    { "kind": "echo", "text": "act -j test: 142 passed, 0 failed" }
+  ],
+  "probes": [
+    { "type": "keep", "at": 0, "text": ".ci/build.yml" },
+    { "type": "keep", "at": 11, "text": "ERR_REQUIRE_ESM" },
+    { "type": "keep", "at": 11, "text": "tests/legacy/report.cjs" },
+    { "type": "keep", "at": 15, "text": "142 passed" },
+    { "type": "correction", "at": 0, "old": "node:22.4", "fix": 7, "new": "22.9" }
+  ]
+}

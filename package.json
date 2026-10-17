@@ -1,0 +1,64 @@
+{
+  "name": "piroboros",
+  "version": "0.1.0",
+  "description": "A Windows-first TUI agent harness with one durable chat that never ends.",
+  "license": "MIT",
+  "author": "samael",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thelastbodhisattva/piroboros.git"
+  },
+  "homepage": "https://github.com/thelastbodhisattva/piroboros#readme",
+  "bugs": {
+    "url": "https://github.com/thelastbodhisattva/piroboros/issues"
+  },
+  "keywords": ["agent", "harness", "tui", "cli", "llm", "coding-agent", "windows"],
+  "type": "module",
+  "bin": {
+    "piroboros": "bin/piroboros.mjs"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "agents/",
+    "skills/",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "CHANGELOG.md",
+    "settings.json.example",
+    "models.json.example"
+  ],
+  "engines": {
+    "node": ">=26.5.0"
+  },
+  "scripts": {
+    "start": "node bin/piroboros.mjs",
+    "setup": "node bin/piroboros.mjs setup",
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && node -e \"require('fs').statSync('dist/main.js')\"",
+    "tune:compactor": "node src/tune/tune.ts"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.3.0",
+    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-durable": "1.3.0",
+    "@ff-labs/fff-node": "0.11.0",
+    "ink": "8.0.0",
+    "react": "19.3.0",
+    "string-width": "8.3.0",
+    "typebox": "1.3.27"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.4",
+    "@types/react": "19.3.0",
+    "typescript": "7.0.2"
+  },
+  "overrides": {
+    "@earendil-works/chord": "1.3.0",
+    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-telemetry": "1.3.0",
+    "typebox": "1.3.27"
+  }
+}

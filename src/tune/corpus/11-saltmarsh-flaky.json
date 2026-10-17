@@ -1,0 +1,25 @@
+{
+  "id": "saltmarsh-flaky",
+  "split": "heldout",
+  "messages": [
+    { "kind": "user", "text": "tests/test_scheduler.py::test_retry_backoff fails about one run in five on CI. Make it stable without deleting it." },
+    { "kind": "piroboros", "text": "A one in five failure suggests timing. I will read the test and the scheduler clock." },
+    { "kind": "tool", "text": "read tests/test_scheduler.py lines 60-95" },
+    { "kind": "echo", "text": "uses time.sleep(0.2) and then asserts job.attempts == 3; the scheduler uses time.monotonic() with a 100 ms tick" },
+    { "kind": "piroboros", "text": "The sleep races the 100 ms tick. A fake clock injected into Scheduler removes the race." },
+    { "kind": "user", "text": "Inject the clock through the constructor, parameter name clock, default time.monotonic. No monkeypatching." },
+    { "kind": "tool", "text": "edit saltmarsh/scheduler.py: def __init__(self, tick_ms=100, clock=time.monotonic)" },
+    { "kind": "echo", "text": "ok" },
+    { "kind": "tool", "text": "edit tests/test_scheduler.py: add FakeClock with advance(ms); remove the sleep" },
+    { "kind": "echo", "text": "ok" },
+    { "kind": "tool", "text": "bash: pytest tests/test_scheduler.py --count=200 -x" },
+    { "kind": "echo", "text": "200 passed in 3.1 s" },
+    { "kind": "piroboros", "text": "test_retry_backoff passes 200 times in a row. The clock parameter defaults to time.monotonic." }
+  ],
+  "probes": [
+    { "type": "keep", "at": 0, "text": "tests/test_scheduler.py::test_retry_backoff" },
+    { "type": "keep", "at": 3, "text": "100 ms tick" },
+    { "type": "keep", "at": 8, "text": "FakeClock" },
+    { "type": "keep", "at": 11, "text": "200 passed" }
+  ]
+}

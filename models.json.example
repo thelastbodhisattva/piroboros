@@ -1,0 +1,34 @@
+{
+  "providers": {
+    "example-llm": {
+      "models": [
+        {
+          "id": "example-chat",
+          "name": "Example chat",
+          "api": "openai-completions",
+          "baseUrl": "https://llm.example.invalid/v1",
+          "reasoning": false,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 200000,
+          "maxTokens": 16000
+        }
+      ]
+    },
+    "example-claude": {
+      "models": [
+        {
+          "id": "example-reasoner",
+          "name": "Example reasoner",
+          "api": "anthropic-messages",
+          "baseUrl": "https://claude-proxy.example.invalid",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 200000,
+          "maxTokens": 32000
+        }
+      ]
+    }
+  }
+}

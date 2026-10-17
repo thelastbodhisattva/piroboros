@@ -1,0 +1,39 @@
+piroboros
+Copyright (c) 2026 samael. Licensed under the MIT License (see LICENSE).
+
+This project incorporates, ports or is designed after the following works.
+
+pi-thinking-steps v1.0.17
+  MIT License, Copyright (c) 2026 Marc Mironescu / FluxGear.
+  Used for: the thinking-step parser (parse.ts, ported unchanged except its import path, with a reduced types file)
+  and the selection helpers pickCollapsedStep and selectSummarySteps (render.ts), in src/tui/thinking/. The
+  rendering is reimplemented in Ink and sanitizing uses src/tui/sanitize.ts, so sanitizeThinkingText is not used.
+
+akashic-forge and mnemosia
+  Ported at commit f0a8ad4 of their source repository (MIT, by their owner).
+  The ported code under src/memory/ is piroboros-owned from the port onward;
+  each ported file carries a provenance header naming its package, file and that commit.
+
+UniiChat / OptChat design and prompts
+  Gist 91837951a5ce5b38f341ec1ba1df6449, revision 3c190e06, by VictorTaelin.
+  Shared publicly by the author and used here as MIT-licensed. The design and the prompts are credited to the
+  author. The prompts are adapted from the gist (revision 3c190e06), not verbatim: the agent is named Piroboros,
+  its own messages are tagged `piroboros`, the paragraph about the user's computers is dropped, and the
+  compaction tasks ask for at most 400 bytes (about 55 words) with a 400-dash ruler.
+
+pi-fff v0.11.0
+  MIT License, by dmtrKovalenko (@ff-labs/pi-fff).
+  Used for: the find and grep output formatting in src/search-format.ts (file annotations, compact grep lines,
+  the weak-match detector, the path-constraint normalizer).
+
+@ff-labs/fff-node v0.11.0
+  MIT License, by dmtrKovalenko. A direct dependency: the indexed file finder behind find and grep.
+
+Unicode confusables data (UTS #39), version 16.0.0
+  Copyright (c) 2024 Unicode, Inc. Unicode License v3, https://www.unicode.org/license.txt
+  Used for: the look-alike letter table in src/memory/akashic/confusables.ts, generated from confusables.txt.
+
+Dependencies
+  The direct dependencies are MIT-licensed, except the development-only compiler (typescript), which is
+  Apache-2.0. Transitive dependencies carry MIT, Apache-2.0, BSD-3-Clause, ISC, 0BSD, Unlicense and
+  MIT OR CC0-1.0 terms. Each package's license text ships with it under node_modules/.

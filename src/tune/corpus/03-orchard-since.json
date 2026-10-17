@@ -1,0 +1,29 @@
+{
+  "id": "orchard-since",
+  "split": "dev",
+  "messages": [
+    { "kind": "user", "text": "Add a --since flag to orchard-cli list. It takes a date like 2026-09-01. The default is the last 30 days." },
+    { "kind": "piroboros", "text": "I will look at how list parses its flags in cmd/list.go." },
+    { "kind": "tool", "text": "read cmd/list.go" },
+    { "kind": "echo", "text": "flags: --limit (int, default 50), --format (string, default table); parsing happens in parseListFlags at line 27" },
+    { "kind": "piroboros", "text": "I will add --since next to --limit and filter in the query builder at store/query.go:112." },
+    { "kind": "user", "text": "Make the default 14 days, not 30. The date must also accept 2026-09-01T10:00." },
+    { "kind": "tool", "text": "edit cmd/list.go: add --since, default 14d" },
+    { "kind": "echo", "text": "ok" },
+    { "kind": "tool", "text": "edit store/query.go:112: add WHERE created_at >= ?" },
+    { "kind": "echo", "text": "ok" },
+    { "kind": "tool", "text": "bash: go test ./..." },
+    { "kind": "echo", "text": "FAIL orchard/cmd TestListSinceBadDate: want error code ERR_DATE_FMT, got nil" },
+    { "kind": "piroboros", "text": "The parser accepts anything. I will allow only the layouts 2006-01-02 and 2006-01-02T15:04 and return ERR_DATE_FMT otherwise." },
+    { "kind": "tool", "text": "bash: go test ./..." },
+    { "kind": "echo", "text": "ok orchard/cmd 0.41s; ok orchard/store 0.22s" },
+    { "kind": "piroboros", "text": "--since works with a default of 14 days, and go test ./... passes in both packages." }
+  ],
+  "probes": [
+    { "type": "keep", "at": 3, "text": "parseListFlags" },
+    { "type": "keep", "at": 4, "text": "store/query.go:112" },
+    { "type": "keep", "at": 11, "text": "ERR_DATE_FMT" },
+    { "type": "keep", "at": 12, "text": "2006-01-02T15:04" },
+    { "type": "correction", "at": 0, "old": "30 days", "fix": 5, "new": "14 days" }
+  ]
+}

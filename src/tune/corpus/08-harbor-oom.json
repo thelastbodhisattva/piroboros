@@ -1,0 +1,28 @@
+{
+  "id": "harbor-oom",
+  "split": "dev",
+  "messages": [
+    { "kind": "user", "text": "The harbor-bot container exits with code 137 a few minutes after it starts. The Docker host is dock-02." },
+    { "kind": "piroboros", "text": "137 means the process was killed, probably out of memory. I will check the container limit and the kernel log." },
+    { "kind": "tool", "text": "bash: docker inspect harbor-bot --format '{{.HostConfig.Memory}}'" },
+    { "kind": "echo", "text": "268435456" },
+    { "kind": "tool", "text": "bash: dmesg | grep -i oom | tail -3" },
+    { "kind": "echo", "text": "Memory cgroup out of memory: Killed process 40117 (node) total-vm 1840212kB, anon-rss 262908kB" },
+    { "kind": "piroboros", "text": "The limit is 256 MiB (268435456 bytes) and the node process reached about 257 MiB resident. The limit is too small for the bot's cache." },
+    { "kind": "user", "text": "Raise it to 512m in compose/harbor.yml. Do not touch the other services in that file. And add a healthcheck on /healthz every 30s." },
+    { "kind": "tool", "text": "edit compose/harbor.yml: mem_limit 512m; healthcheck GET /healthz interval 30s retries 3" },
+    { "kind": "echo", "text": "ok" },
+    { "kind": "tool", "text": "bash: docker compose -f compose/harbor.yml up -d harbor-bot" },
+    { "kind": "echo", "text": "harbor-bot Recreated, Started; health: starting" },
+    { "kind": "tool", "text": "bash: docker ps --filter name=harbor-bot" },
+    { "kind": "echo", "text": "harbor-bot Up 3 minutes (healthy)" },
+    { "kind": "piroboros", "text": "harbor-bot runs with 512m and is healthy after 3 minutes. Only harbor-bot was recreated." }
+  ],
+  "probes": [
+    { "type": "keep", "at": 0, "text": "dock-02" },
+    { "type": "keep", "at": 5, "text": "40117" },
+    { "type": "keep", "at": 7, "text": "/healthz" },
+    { "type": "keep", "at": 7, "text": "compose/harbor.yml" },
+    { "type": "keep", "at": 13, "text": "(healthy)" }
+  ]
+}

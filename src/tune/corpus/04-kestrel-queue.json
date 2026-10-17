@@ -1,0 +1,26 @@
+{
+  "id": "kestrel-queue",
+  "split": "dev",
+  "messages": [
+    { "kind": "user", "text": "Customers report 504 errors from kestrel-api on POST /v2/orders between 09:00 and 09:20 UTC." },
+    { "kind": "piroboros", "text": "I will check the gateway log and the order worker queue for that window." },
+    { "kind": "tool", "text": "bash: grep -c 504 /var/log/kestrel/gateway-2026-10-13.log" },
+    { "kind": "echo", "text": "1,942" },
+    { "kind": "tool", "text": "bash: kestrelctl queue stats orders" },
+    { "kind": "echo", "text": "orders: depth 18,400, workers 4, oldest job waiting 612 s, dead-letter 37" },
+    { "kind": "piroboros", "text": "Four workers cannot drain 18,400 jobs in time. The gateway timeout is 30 s and jobs wait 612 s." },
+    { "kind": "user", "text": "Raise workers to 10 for the orders queue only. Do not change the gateway timeout. Also tell me which 37 jobs are dead." },
+    { "kind": "tool", "text": "bash: kestrelctl queue dead orders --ids" },
+    { "kind": "echo", "text": "job-90412, job-90413, job-90455 and 34 more, all failed with ERR_STOCK_LOCK" },
+    { "kind": "tool", "text": "bash: kestrelctl queue scale orders --workers 10" },
+    { "kind": "echo", "text": "orders workers 4 -> 10, applied at 09:41:07" },
+    { "kind": "piroboros", "text": "Workers are at 10 for orders only. The 37 dead jobs share ERR_STOCK_LOCK, first ids job-90412, job-90413, job-90455. The gateway timeout stays at 30 s." }
+  ],
+  "probes": [
+    { "type": "keep", "at": 3, "text": "1,942" },
+    { "type": "keep", "at": 5, "text": "18,400" },
+    { "type": "keep", "at": 9, "text": "job-90455" },
+    { "type": "keep", "at": 9, "text": "ERR_STOCK_LOCK" },
+    { "type": "keep", "at": 11, "text": "09:41:07" }
+  ]
+}
