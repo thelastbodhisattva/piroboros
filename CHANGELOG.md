@@ -4,6 +4,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## [Unreleased]
 
+New features and bug fixes are planned for 2026-10-22.
+
+### Changed
+
+- The README is a short overview with diagrams of a turn, the Conclave and where data goes. The full reference moved to `docs/`, which ships in the package.
+
 ## [0.1.0] - 2026-10-17
 
 First release.
