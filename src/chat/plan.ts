@@ -15,6 +15,7 @@ export const PlanDoc = defineDoc<PlanState>({
 	kind: "piroboros.plan",
 	version: 1,
 	initial: () => ({ items: [] }),
+	checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
 	migrate: (_value, fromVersion) => { throw new Error(`unsupported piroboros.plan v${fromVersion}`); },
 });
 

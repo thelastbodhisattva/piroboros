@@ -47,6 +47,7 @@ export const TurnStateDoc = defineDoc<TurnState>({
 	kind: "piroboros.turnState",
 	version: 1,
 	initial: () => ({ itemIds: [], cwd: "", at: 0, T: 0, windowStart: 0, compactor: "not configured", reportOnly: false }),
+	checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
 	migrate: (_value, fromVersion) => { throw new Error(`unsupported piroboros.turnState v${fromVersion}`); },
 });
 

@@ -60,6 +60,7 @@ export const NodeDoc = defineDocFamily<{ text: string; bytes: number }, { text: 
 	version: 1,
 	family: true,
 	initial: (seed) => ({ text: seed.text, bytes: seed.bytes }),
+	checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
 	migrate: (_value, fromVersion) => { throw new Error(`unsupported piroboros.node v${fromVersion}`); },
 });
 

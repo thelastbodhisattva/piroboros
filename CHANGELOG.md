@@ -9,6 +9,8 @@ New features and bug fixes are planned for 2026-10-22.
 ### Changed
 
 - The README is a short overview with diagrams of a turn, the Conclave and where data goes. The full reference moved to `docs/`, which ships in the package.
+- The turn state, plan, Conclave and node documents now store a full copy after every 64 changes, so a long chat no longer replays its whole change history each time one of them is read.
+- `--backup` writes to `<file>.tmp`, checks the copy with SQLite `quick_check` and only then renames it, so a failed backup never leaves a file under the final name.
 
 ## [0.1.0] - 2026-10-17
 

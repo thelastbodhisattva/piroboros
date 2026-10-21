@@ -1,6 +1,5 @@
 import { createInterface } from "node:readline/promises";
-import { DatabaseSync } from "node:sqlite";
-import { existsSync, rmSync, writeSync } from "node:fs";
+import { existsSync, writeSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { FileCredentialStore } from "./auth.ts";
 import {
@@ -15,7 +14,7 @@ import { failureText } from "./chat/turn.ts";
 import { sanitizeTerminal } from "./tui/sanitize.ts";
 import { themeSequences } from "./tui/theme.ts";
 import { SETUP_HINT, SetupError } from "./setup.ts";
-import { recentEntries, SessionFailed, type Storage } from "./durable.ts";
+import { backupDatabase, recentEntries, SessionFailed, type Storage } from "./durable.ts";
 
 // Command line entry. Exit codes: 0 success, 1 runtime failure or cancel, 2 missing requirement or no main
 // model, 3 another process holds the lock, 4 login required, 5 config files changed outside piroboros.
@@ -169,15 +168,11 @@ export async function main(argv: readonly string[], deps: MainDeps = {}): Promis
 			if (!existsSync(paths.chat)) { err("piroboros: there is no chat database to back up yet\n"); return EXIT.failure; }
 			const target = resolve(parsed.file!);
 			if (existsSync(target)) { err(`piroboros: ${target} already exists; choose a new file name\n`); return EXIT.failure; }
-			const db = new DatabaseSync(paths.chat);
 			try {
-				db.prepare("VACUUM INTO ?").run(target);
+				backupDatabase(paths.chat, target);
 			} catch (error) {
-				rmSync(target, { force: true });
 				err(`piroboros: backup failed: ${error instanceof Error ? error.message : String(error)}\n`);
 				return EXIT.failure;
-			} finally {
-				db.close();
 			}
 			out(`backup written to ${target}\n`);
 			return EXIT.ok;

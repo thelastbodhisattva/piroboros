@@ -1,5 +1,5 @@
 import {
-	configure, ctx, defineDoc, defineExtension, defineTask, isIdle, isTaskLive, LiveDoc, recentEntries, ROOT,
+	configure, ctx, defineDoc, defineExtension, defineTask, isIdle, isLiveStatus, isTaskLive, LiveDoc, recentEntries, ROOT,
 	type Conversation, type EntryRecord, type Extension, type HarnessType, type Registry, type TaskRuntime, type Tx, type UserInput,
 } from "../durable.ts";
 import { CONCLAVE_MEMBERS, withDefaults, type Settings } from "../config.ts";
@@ -135,6 +135,7 @@ export const ConclaveDoc = defineDoc<ConclaveState>({
 	kind: "piroboros.conclave",
 	version: 1,
 	initial: () => ({ taskId: null, vesperia: null, mode: null, task: "", review: { complete: false, reports: [] }, outcome: "", runs: {} }),
+	checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
 	migrate: (_value, fromVersion) => { throw new Error(`unsupported piroboros.conclave v${fromVersion}`); },
 });
 
@@ -227,7 +228,6 @@ export function feedWatch(h: HarnessType, conv: number, watch: MemberWatch, onLi
 /* --- helpers ---------------------------------------------------------------------------------------------------- */
 
 const ROOT_BUSY = "the root is busy; wait for the current turn to finish (or press Esc), then run the command again";
-const LIVE_STATUSES = new Set(["pending", "running", "waiting", "completing"]);
 const taskKey = (id: string): never => (/^\d+$/u.test(id) ? Number(id) : id) as never;
 const textOfEntry = (entry: EntryRecord | undefined): string => {
 	const content = (entry?.model as Array<{ content?: unknown }> | undefined)?.[0]?.content;
@@ -314,7 +314,7 @@ export class Conclave {
 		if (!doc?.taskId) return "no pipeline is running";
 		const record = await this.h.getTask(taskKey(doc.taskId), ctx).catch(() => undefined);
 		const status = (record?.state as { status?: string } | undefined)?.status;
-		if (record !== undefined && !LIVE_STATUSES.has(status ?? "")) {
+		if (record !== undefined && !isLiveStatus(status)) {
 			const outcome = this.outcomeText(record);
 			await this.h.commit(async (tx) => { (await tx.doc(ConclaveDoc)).taskId = null; }, ctx);
 			return `pipeline already ended (${outcome})`;
@@ -337,8 +337,8 @@ export class Conclave {
 		if (!doc?.taskId) return doc?.outcome ? `no pipeline is running; the last one: ${doc.outcome}` : "no pipeline has run";
 		const record = await this.h.getTask(taskKey(doc.taskId), ctx).catch(() => undefined);
 		if (record === undefined) return "the pipeline state could not be read; it is treated as running";
-		const status = (record.state as { status?: string }).status ?? "";
-		if (!LIVE_STATUSES.has(status)) return `no pipeline is running; the last one: ${this.outcomeText(record)}`;
+		const status = (record.state as { status?: string }).status;
+		if (!isLiveStatus(status)) return `no pipeline is running; the last one: ${this.outcomeText(record)}`;
 		const input = record.input as PipelineInput;
 		const cp = (record.state as { checkpoint?: Checkpoint }).checkpoint;
 		const seat = cp === undefined ? undefined : input.members[cp.i];
@@ -536,7 +536,7 @@ export class Conclave {
 				// Table reads come first (D20). The check is repeated in the creating commit, so two starts cannot both win.
 				if (before !== null) {
 					const record = await tx.task(taskKey(before));
-					if (record === undefined || LIVE_STATUSES.has((record.state as { status?: string }).status ?? "")) throw new Error("a pipeline is already running; /conclave cancel stops it");
+					if (record === undefined || isLiveStatus((record.state as { status?: string }).status)) throw new Error("a pipeline is already running; /conclave cancel stops it");
 				}
 				// The idle check above ran before the credential awaits; a root turn may have started since.
 				if ((await tx.doc(LiveDoc, ROOT)).run !== undefined) throw new Error(ROOT_BUSY);

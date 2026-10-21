@@ -1,3 +1,5 @@
+import { renameSync, rmSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { Context } from "@earendil-works/chord";
 import {
@@ -113,6 +115,25 @@ export async function openHarness(options: OpenOptions): Promise<HarnessType> {
 	}, ctx);
 }
 
+/** Copy a SQLite database through `<target>.tmp`, checked by quick_check, so a partial copy never has the final name. The caller rules out an existing target. */
+export function backupDatabase(source: string, target: string): void {
+	const tmp = `${target}.tmp`;
+	rmSync(tmp, { force: true });
+	try {
+		const db = new DatabaseSync(source);
+		try { db.prepare("VACUUM INTO ?").run(tmp); } finally { db.close(); }
+		const copy = new DatabaseSync(tmp, { readOnly: true });
+		try {
+			const rows = copy.prepare("PRAGMA quick_check").all() as { quick_check: string }[];
+			if (rows.length !== 1 || rows[0]!.quick_check !== "ok") throw new Error(`the copy failed quick_check: ${rows.map((r) => r.quick_check).join("; ")}`);
+		} finally { copy.close(); }
+		renameSync(tmp, target);
+	} catch (error) {
+		rmSync(tmp, { force: true });
+		throw error;
+	}
+}
+
 /* --- named behaviors ---------------------------------------------------------------------------------- */
 
 export const MARKER_KIND = "piroboros.turn";
@@ -156,7 +177,8 @@ export function submitSteer(root: Conversation, content: UserInput, requestId: s
 	return root.submit({ type: "input", content, whenBusy: "steer", requestId }, ctx);
 }
 
-const LIVE_STATUSES = new Set(["pending", "running", "waiting", "completing"]);
+/** Every status but terminal is live, so a status this code does not know counts as live (fails closed). */
+export const isLiveStatus = (status: string | undefined): boolean => status !== "terminal";
 
 /**
  * Whether a task is live. Fails closed: a task that cannot be read, is absent, or reports a status this
@@ -167,7 +189,7 @@ export async function isTaskLive(harness: Pick<HarnessType, "getTask">, taskId: 
 		const record = await harness.getTask((/^\d+$/u.test(taskId) ? Number(taskId) : taskId) as never, ctx);
 		if (record === undefined) return true;
 		const status = (record.state as { status?: string }).status;
-		return status === undefined || LIVE_STATUSES.has(status);
+		return isLiveStatus(status);
 	} catch {
 		return true;
 	}
