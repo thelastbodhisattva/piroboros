@@ -105,6 +105,51 @@ export function killsProcess(command: unknown): boolean {
 	return typeof command === "string" && (KILL_VERB.test(command) || WMIC_KILL.test(command));
 }
 
+const CREDENTIAL_NAME = /^(?:auth\.json|mcp-auth\.json|\.git-credentials|\.netrc|_netrc|\.pypirc|id_(?:rsa|dsa|ecdsa|ed25519)(?!.*\.pub$).*)$/iu;
+const WORD_BREAK = /[\s'"`;|&<>()]/u;
+
+/**
+ * A reason when a shell command plainly reaches a protected location, else undefined. Like killsProcess this is a
+ * tripwire against accidents (an agent in an allowed folder climbing out of it), not confinement: bash is not
+ * sandboxed and a command can be worded around it with variables, globs or a script. It matches text, not a parsed shell.
+ * Rules: a deny root named in any common spelling (unless inside a guard.allow folder and not a credential name),
+ * a credential file name, and a `..` that leaves the allowed folder the working directory sits in.
+ */
+export function shellPathRefusal(command: unknown, cwd: string | undefined, config: GuardConfig): string | undefined {
+	if (typeof command !== "string") return undefined;
+	const hint = "; use the file tools for files inside the allowed folder (this check is a tripwire, not confinement)";
+	const win = process.platform === "win32";
+	const text = (win ? command.toLowerCase() : command).replaceAll("\\", "/");
+	const folders = allowedFolders(config);
+	const profile = config.profile ?? homedir();
+	for (const root of denyRoots(config)) {
+		const abs = resolve(root);
+		const fwd = abs.replaceAll("\\", "/");
+		const drive = /^([a-z]):/iu.exec(fwd)?.[1];
+		const home = isInside(profile, abs) ? relative(profile, abs).replaceAll("\\", "/") : undefined;
+		const forms = [fwd, ...(drive ? [`/${drive}${fwd.slice(2)}`, `/mnt/${drive}${fwd.slice(2)}`] : []), ...(home ? ["~/", "$HOME/", "${HOME}/", "%USERPROFILE%/", "$env:USERPROFILE/"].map((p) => p + home) : [])];
+		for (const form of forms) {
+			const needle = win ? form.toLowerCase() : form;
+			for (let at = text.indexOf(needle); at >= 0; at = text.indexOf(needle, at + 1)) {
+				const end = at + needle.length;
+				if (/[\w.-]/u.test(text[end] ?? "")) continue; // `~/.pine` is not `~/.pi`
+				const target = resolve(fwd + text.slice(end).split(WORD_BREAK, 1)[0]);
+				let real = target;
+				try { real = canonicalize(target); } catch { /* keep the lexical path */ }
+				if (!folders.some((f) => isInside(f.entry, real)) || WIDE_SECRET.some((p) => p.test(real.split(/[\\/]/u).pop() ?? ""))) return `the command names a protected location${hint}`;
+			}
+		}
+	}
+	const tokens = command.split(/[\s'"`;|&<>()=]+/u).filter(Boolean);
+	if (tokens.some((t) => CREDENTIAL_NAME.test(t.split(/[\\/]/u).pop() ?? ""))) return `the command names a credential file${hint}`;
+	try {
+		const here = cwd ? canonicalize(cwd) : undefined;
+		const folder = here === undefined ? undefined : folders.find((f) => isInside(f.entry, here));
+		if (here !== undefined && folder && tokens.some((t) => t.split(/[\\/]/u).includes("..") && !isInside(folder.entry, resolve(here, t)))) return `the command leaves the allowed folder${hint}`;
+	} catch { /* an unreadable cwd leaves rules 1 and 2 only */ }
+	return undefined;
+}
+
 export interface PathVerdict {
 	allowed: boolean;
 	reason?: string;
@@ -338,6 +383,11 @@ export function createGuard(deps: GuardDeps): Guard {
 			if (denied !== undefined) return { block: `blocked by guard: ${denied}` };
 		}
 		if (SHELL_TOOLS.has(call.name) && killsProcess(args.command)) return { block: "blocked by guard: process-kill commands are not allowed from the agent" };
+		if (SHELL_TOOLS.has(call.name)) {
+			try { cwd = (await api.snapshot(AgentDoc, api.conversationId, ctx))?.cwd; } catch { cwd = undefined; }
+			const refusal = shellPathRefusal(args.command, cwd, config);
+			if (refusal !== undefined) return { block: `blocked by guard: ${refusal}` };
+		}
 		if (WRITE_TOOLS.has(call.name)) {
 			const refusal = readFirst(id, args.path, cwd);
 			if (refusal !== undefined) return { block: `blocked by guard: ${refusal}` };

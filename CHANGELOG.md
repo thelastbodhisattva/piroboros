@@ -8,6 +8,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 - Learning loop and `/learn`. With `learning.model` set, a background pass every few user turns proposes skills and memories from the chat. Skills are staged and written only after `/learn accept <name>` shows the text or diff; memories are quarantined until `/akashic accept`. `/learn undo`, `reject`, `now`, `retry` and `skip`. New settings `learning.model`, `learning.thinking`, `learning.everyTurns` and `learning.allowThirdParty`; the model and the consent flag are security settings.
 - `guard.allow`: project folders opened inside a protected location, at or inside the pi extensions folder or strictly inside a `guard.deny` root. Credential file names stay refused inside them. A security setting, confirmed on change.
+- A bash path tripwire: commands that name a protected location or a credential file, or climb out of a `guard.allow` folder with `..`, are refused. It catches accidents and is not confinement.
 - `PI_CODING_AGENT_DIR` outside `~/.pi` is protected like `~/.pi`.
 
 ### Fixed
