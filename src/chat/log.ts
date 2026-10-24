@@ -160,7 +160,7 @@ export interface Mapped {
 	text: string;
 }
 
-const EXCLUDED_STOP = new Set(["aborted", "error", "deferred"]);
+export const EXCLUDED_STOP = new Set(["aborted", "error", "deferred"]);
 const normalize = (text: string): string => text.replace(/\r\n?/gu, "\n");
 
 /** Cut text into pieces of at most `SPLIT_CHARS` UTF-16 units, never between the halves of a surrogate pair. */

@@ -21,6 +21,11 @@ UniiChat / OptChat design and prompts
   its own messages are tagged `piroboros`, the paragraph about the user's computers is dropped, and the
   compaction tasks ask for at most 400 bytes (about 55 words) with a 400-dash ruler.
 
+Hermes Agent (NousResearch/hermes-agent, commit 7162533)
+  MIT License, Copyright (c) 2025 Nous Research.
+  Design credit for the learning loop (src/learn.ts): periodic review of the conversation that proposes skills and
+  short memories. The logic is reimplemented for piroboros; no source text or prompt text is copied.
+
 pi-fff v0.11.0
   MIT License, by dmtrKovalenko (@ff-labs/pi-fff).
   Used for: the find and grep output formatting in src/search-format.ts (file annotations, compact grep lines,

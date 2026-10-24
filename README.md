@@ -114,6 +114,7 @@ A compactor on a third-party provider needs your consent (`compactor.allowThirdP
 | `--backup <file>` | Writes a copy of the chat database |
 | `/model`, `/settings`, `/login` | Change the main model, edit `settings.json`, sign in |
 | `/reload`, `/status` | Re-read the config files, show the view and cache state |
+| `/learn` | Learning loop: status, proposals, accept, reject, undo |
 | `/telemetry` | Model requests, latency and cost of the last 24 hours |
 | `/conclave <task>`, `approve`, `cancel`, `status`, `undo` | Run and control the Conclave |
 | `/akashic` | Memory and vault commands |

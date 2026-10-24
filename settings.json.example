@@ -7,6 +7,7 @@
     "maxConcurrent": 8,
     "allowThirdParty": false
   },
+  "learning": { "thinking": "low", "everyTurns": 10, "allowThirdParty": false },
   "conclave": {
     "defaultModel": "example-llm/example-chat",
     "maxTurns": 64,

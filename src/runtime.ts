@@ -18,6 +18,7 @@ import { createSkills, type Skills } from "./skills.ts";
 import { contextCheck, createAppModels, resolveModel, type CustomProviders, type Models, type Provider } from "./models.ts";
 import { CompactLoop } from "./chat/compactloop.ts";
 import { Compactor } from "./chat/compactor.ts";
+import { Learner, LearnLoop, type LearnDeps } from "./learn.ts";
 import { budget, chat, createStuck, planning, viewtools } from "./chat/extension.ts";
 import { checkMappingVersion } from "./chat/log.ts";
 import { TurnLoop, enqueueMessage, type TurnStatus } from "./chat/turn.ts";
@@ -59,6 +60,8 @@ export interface RuntimeOptions {
 	search?: Pick<SearchDeps, "loadFff" | "rg">;
 	/** Test seams for the Conclave: the definitions to load and a hook that runs at the start of each phase. */
 	conclave?: Pick<ConclaveDeps, "definitions" | "beforePhase">;
+	/** Test seams for the learning loop: a hook at the start of each phase and the request timeout. */
+	learn?: Pick<LearnDeps, "beforePhase" | "requestTimeoutMs">;
 	/** Test seam: waits after a compactor provider error, in milliseconds (default 1,000, 2,000). */
 	compactorBackoffMs?: readonly number[];
 	/** Test seam: the compactor request timeout in milliseconds (default 300,000). */
@@ -79,6 +82,8 @@ export interface Runtime {
 	loop: TurnLoop;
 	/** BuildNode tasks, the gate and the compactor's status. */
 	compactor: Compactor;
+	/** /learn: the learning loop's passes, proposals and ledger. */
+	learner: Learner;
 	guard: Guard;
 	/** /conclave: start, approve, cancel, status. */
 	conclave: Conclave;
@@ -160,6 +165,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 		// A new global thinking-steps value replaces the session choice, so it shows at once.
 		if ("unset" in change ? change.unset === "tui.thinkingSteps" : change.set.tui?.thinkingSteps !== undefined) thinking.clearSession();
 		loop.wake();
+		learnLoop.wake();
 		return withDefaults(settings).planning !== planningOn ? PLANNING_NOTE : undefined;
 	};
 	const checkMain: Runtime["checkMain"] = (ref) => {
@@ -229,6 +235,8 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 		}
 	};
 	const compactor = new Compactor({ settings: effective, models, authPath: paths.auth, env: options.env ?? process.env, instructions: readInstructions, ...(options.compactorBackoffMs === undefined ? {} : { backoffMs: options.compactorBackoffMs }), ...(options.compactorTimeoutMs === undefined ? {} : { requestTimeoutMs: options.compactorTimeoutMs }) });
+	// The learner reads the chat and the skills, and writes memories as QUARANTINED; its task lives in the registry only.
+	const learner = new Learner({ home: options.home, cwd, settings: effective, models, compactor, memory, skills, notice: (message) => options.onStatus?.({ kind: "notice", message }), ...options.learn });
 	const registry = createRegistry();
 	// web_fetch lives in its own extension, which the root never selects. The tool also checks the caller's seat and web.enabled itself.
 	const webKey = (provider: SearchProvider): string | undefined => searchKey(provider, paths.auth, options.env ?? process.env);
@@ -254,7 +262,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 		onVesperia: (run) => { ensureRun(options.home, run); },
 	});
 	// The compactor and conclave extensions carry only their tasks, which any conversation's tasks resolve by name.
-	for (const extension of [guard.extension, base, viewtools, planning, memoryExtension, webExtension, stuck, chat, skills.extension, budget, compactor.extension, conclave.extension]) registry.install(extension);
+	for (const extension of [guard.extension, base, viewtools, planning, memoryExtension, webExtension, stuck, chat, skills.extension, budget, compactor.extension, learner.extension, conclave.extension]) registry.install(extension);
 	// D12: the root selects the chat extensions explicitly, and the budget extension is last everywhere. The plan
 	// tool is part of the selection unless settings.planning is false; that is read at start, so the tool list
 	// stays the same for the life of the process. The memory extension follows the other tool extensions: it has
@@ -314,6 +322,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 		memory.close();
 		throw error;
 	}
+	learner.bind(harness, root);
 	harness.resume();
 	// Root idle watchdog: a MemberWatch fed by the root's commits. Its timer runs only while a run is in progress.
 	const idleMs = options.rootIdleTimeoutMs ?? ROOT_IDLE_TIMEOUT_MS;
@@ -333,6 +342,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 	if (parked.length > 0) options.onStatus?.({ kind: "notice", message: pausedText(parked.length) });
 
 	const compact = new CompactLoop({ harness, root, compactor, onAlarm: (text) => report(`alarm: ${text}`), onReport: (error) => report(reportMessage(error)) });
+	const learnLoop = new LearnLoop({ harness, learner, onReport: (error) => report(reportMessage(error)) });
 	const loop = new TurnLoop({
 		harness,
 		root,
@@ -353,6 +363,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 	});
 	if (options.autostart !== false) {
 		compact.start();
+		learnLoop.start();
 		loop.start();
 	}
 
@@ -363,6 +374,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 		root,
 		loop,
 		compactor,
+		learner,
 		guard,
 		conclave,
 		search,
@@ -392,6 +404,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 				settings = next;
 				if (changes.tampered) recordIntegrity(options.home);
 				loop.wake();
+				learnLoop.wake();
 				const warnings = [...(custom?.ok && custom.warnings ? custom.warnings : []), ...(withDefaults(next).planning !== planningOn ? [PLANNING_NOTE] : [])];
 				return { ok: true, ...(warnings.length > 0 ? { warnings } : {}) };
 			} catch (error) {
@@ -431,6 +444,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 			await step(() => { unwatch(); clearInterval(idleTimer); idleTimer = undefined; });
 			await step(() => loop.stop());
 			await step(() => compact.stop());
+			await step(() => learnLoop.stop());
 			await step(() => search.close());
 			await step(() => harness.close(ctx));
 			await step(() => telemetry?.close());

@@ -508,6 +508,7 @@ export function runCommand(rt: Runtime, text: string, ask?: (question: string) =
 	if (name === "telemetry") return rt.telemetry();
 	if (name === "skills") return skillsReport(rt.skills.state(), COMMANDS.map((command) => command.name));
 	if (name === "akashic") return rt.akashic(rest.join(" "));
+	if (name === "learn") return rt.learner.command(rest.filter((word) => word !== ""), ask);
 	if (name === "thinking-steps") return thinkingStepsCommand(rt, rest);
 	return undefined;
 }

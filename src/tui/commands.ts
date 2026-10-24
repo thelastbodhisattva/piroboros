@@ -20,6 +20,7 @@ export const COMMANDS: readonly CommandInfo[] = [
 	{ name: "akashic", description: "memory status, accept and vault", args: "[status | accept | vault ...]" },
 	{ name: "thinking-steps", description: "choose how thinking steps are shown", args: "[mode | global <mode | clear>]" },
 	{ name: "skills", description: "list the skills the chat can use" },
+	{ name: "learn", description: "the learning loop: status, proposals, undo", args: "[now | accept <name> | reject <name|all> | undo <name> | retry | skip]" },
 	{ name: "telemetry", description: "model requests, latency and cost of the last 24 hours" },
 ];
 
@@ -139,6 +140,7 @@ export function suggest(value: string, models: readonly ModelOption[] = [], logi
 		if (tokens.length === 1) return words(lead, last, [...MODES, "global"], ["global"]);
 		return tokens.length === 2 && tokens[0] === "global" ? words(lead, last, [...MODES, "clear"]) : [];
 	}
+	if (name === "learn") return tokens.length > 1 ? [] : words(lead, last, ["now", "accept", "reject", "undo", "retry", "skip"]);
 	if (name === "akashic") {
 		if (tokens.length === 1) return words(lead, last, ["status", "accept", "vault"], ["vault"]);
 		return tokens.length === 2 && tokens[0] === "vault" ? words(lead, last, VAULT) : [];

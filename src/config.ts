@@ -161,6 +161,8 @@ export interface Settings {
 	main?: string;
 	thinking?: string;
 	compactor?: { enabled?: boolean; model?: string; thinking?: string; maxConcurrent?: number; allowThirdParty?: boolean };
+	/** The learning loop (P27c). Off until a model is set. */
+	learning?: { model?: string; thinking?: string; everyTurns?: number; allowThirdParty?: boolean };
 	conclave?: {
 		defaultModel?: string;
 		maxTurns?: number;
@@ -186,6 +188,7 @@ export interface Settings {
 export const SETTINGS_DEFAULTS = {
 	thinking: "medium",
 	compactor: { enabled: true, thinking: "off", maxConcurrent: 8, allowThirdParty: false },
+	learning: { thinking: "low", everyTurns: 10, allowThirdParty: false },
 	conclave: { maxTurns: 64, idleTimeoutMs: 600_000, reportMaxChars: 4_000 },
 	gateTimeoutMs: 120_000,
 	cacheRetention: "short",
@@ -235,7 +238,7 @@ export function validateSettings(value: unknown): Settings {
 			if (v !== undefined && (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max)) issues.push(`${path}: must be an integer from ${min}${max === Number.MAX_SAFE_INTEGER ? " up" : ` to ${max}`}`);
 		},
 	};
-	known(value, ["main", "thinking", "compactor", "conclave", "gateTimeoutMs", "cacheRetention", "shellEnvAllow", "shellTimeoutMs", "guard", "tui", "planning", "telemetry", "web"], "");
+	known(value, ["main", "thinking", "compactor", "learning", "conclave", "gateTimeoutMs", "cacheRetention", "shellEnvAllow", "shellTimeoutMs", "guard", "tui", "planning", "telemetry", "web"], "");
 	check.ref(value.main, "main");
 	check.level(value.thinking, "thinking");
 	if (value.compactor !== undefined) {
@@ -247,6 +250,16 @@ export function validateSettings(value: unknown): Settings {
 			check.level(value.compactor.thinking, "compactor.thinking");
 			check.int(value.compactor.maxConcurrent, "compactor.maxConcurrent", 1, 8);
 			check.bool(value.compactor.allowThirdParty, "compactor.allowThirdParty");
+		}
+	}
+	if (value.learning !== undefined) {
+		if (!isObj(value.learning)) issues.push("learning: must be an object");
+		else {
+			known(value.learning, ["model", "thinking", "everyTurns", "allowThirdParty"], "learning");
+			check.ref(value.learning.model, "learning.model");
+			check.level(value.learning.thinking, "learning.thinking");
+			check.int(value.learning.everyTurns, "learning.everyTurns", 3, 100);
+			check.bool(value.learning.allowThirdParty, "learning.allowThirdParty");
 		}
 	}
 	if (value.conclave !== undefined) {
@@ -329,6 +342,7 @@ export function withDefaults(settings: Settings) {
 		main: settings.main,
 		thinking: settings.thinking ?? SETTINGS_DEFAULTS.thinking,
 		compactor: { ...SETTINGS_DEFAULTS.compactor, ...settings.compactor },
+		learning: { ...SETTINGS_DEFAULTS.learning, ...settings.learning },
 		conclave: { ...SETTINGS_DEFAULTS.conclave, ...settings.conclave },
 		gateTimeoutMs: settings.gateTimeoutMs ?? SETTINGS_DEFAULTS.gateTimeoutMs,
 		cacheRetention: settings.cacheRetention ?? SETTINGS_DEFAULTS.cacheRetention,
@@ -500,6 +514,8 @@ function securityKeys(settings: unknown): Record<string, unknown> {
 		main: settings.main,
 		"compactor.model": isObj(settings.compactor) ? settings.compactor.model : undefined,
 		"compactor.allowThirdParty": isObj(settings.compactor) ? settings.compactor.allowThirdParty : undefined,
+		"learning.model": isObj(settings.learning) ? settings.learning.model : undefined,
+		"learning.allowThirdParty": isObj(settings.learning) ? settings.learning.allowThirdParty : undefined,
 		"conclave.defaultModel": isObj(settings.conclave) ? settings.conclave.defaultModel : undefined,
 		"conclave.members.models": members,
 		shellEnvAllow: settings.shellEnvAllow,
@@ -580,7 +596,7 @@ const field = (path: string, type: SettingType, applies: SettingApplies, extra: 
 	path, type, applies, security: SECURITY_KEYS.includes(path) || /^conclave\.members\.[a-z]+\.model$/u.test(path), ...extra,
 });
 
-/** Every leaf key of settings.json (58). A test checks it against validateSettings, securityKeys and the defaults. */
+/** Every leaf key of settings.json (62). A test checks it against validateSettings, securityKeys and the defaults. */
 export const SETTING_FIELDS: readonly SettingField[] = [
 	field("main", "ref", "turn", { role: "main" }),
 	field("thinking", "enum", "turn", { values: THINKING_LEVELS }),
@@ -589,6 +605,10 @@ export const SETTING_FIELDS: readonly SettingField[] = [
 	field("compactor.thinking", "enum", "now", { values: THINKING_LEVELS }),
 	field("compactor.maxConcurrent", "int", "now", { min: 1, max: 8 }),
 	field("compactor.allowThirdParty", "bool", "now"),
+	field("learning.model", "ref", "now", { role: "main" }),
+	field("learning.thinking", "enum", "now", { values: THINKING_LEVELS }),
+	field("learning.everyTurns", "int", "now", { min: 3, max: 100 }),
+	field("learning.allowThirdParty", "bool", "now"),
 	field("conclave.defaultModel", "ref", "run", { role: "main" }),
 	field("conclave.maxTurns", "int", "run", { min: 1 }),
 	field("conclave.idleTimeoutMs", "int", "run", { min: 1_000 }),

@@ -7,7 +7,7 @@ import { defineTool, type ToolExecutionApi, type ToolRegistration } from "../../
 import { StringEnum } from "../../models.ts";
 import type { MemoryHost } from "../host.ts";
 import { flatten } from "./snapshot.ts";
-import { MEMORY_KINDS, MemoryKind, validateMemorySafety, type MemoryRecord, type MemoryScope, type MemoryUsage, type ScopeFilter, type SearchResult } from "./store.ts";
+import { MEMORY_KINDS, MemoryKind, validateMemorySafety, type MemoryInput, type MemoryRecord, type MemoryScope, type MemoryUsage, type ScopeFilter, type SearchResult } from "./store.ts";
 import type { VaultFailure } from "./vault.ts";
 
 export const ACTIONS = ["remember", "record", "search", "update", "forget", "recent", "group"] as const;
@@ -73,6 +73,23 @@ function visible(results: readonly SearchResult[]): { shown: SearchResult[]; wit
 	return { shown, withheld: results.length - shown.length };
 }
 
+/**
+ * Remember `input` through the vault mirror. With `hold`, the new records are quarantined in the same transaction, so they
+ * stay out of the snapshot until the user accepts them (F3). Throws on a scanner hit, like `rememberWithStatus`.
+ */
+export function rememberHeld(host: MemoryHost, input: MemoryInput, actor: string, hold: boolean, reason: string) {
+	const { store } = host;
+	return host.vault.write(() => store.transaction(() => {
+		const written = store.rememberWithStatus(input);
+		if (!hold) return written;
+		for (const memory of written.memories) {
+			if (memory.duplicate === true || memory.state !== "ACTIVE") continue;
+			host.api.mutateMemory({ memoryId: memory.id, idempotencyKey: `quarantine:${memory.id}`, expectedVersion: memory.version, actor, reason, transition: "QUARANTINED" });
+		}
+		return { ...written, memories: written.memories.map((memory) => store.getMemory(memory.id) ?? memory) };
+	}));
+}
+
 export function createAkashicTool(host: MemoryHost, caller: WriterCaller): ToolRegistration {
 	const { store } = host;
 	return defineTool({
@@ -92,18 +109,7 @@ export function createAkashicTool(host: MemoryHost, caller: WriterCaller): ToolR
 						if (!args.content) throw new Error("content is required");
 						const scope = scopeForMemory(args.scope);
 						const input = { kind: args.kind ?? MemoryKind.ProjectState, content: args.content, scope, ...(scope === "project" ? { project: args.project ?? who.cwd } : {}), ...(args.tags === undefined ? {} : { tags: args.tags }), ...(args.importance === undefined ? {} : { importance: args.importance }), provenance: stamp };
-						const { result, vault } = await host.vault.write(() => store.transaction(() => {
-							const written = store.rememberWithStatus(input);
-							// F3: a write made while the turn held only reports is held out of the snapshot until the user accepts it.
-							if (who.reportOnly) {
-								for (const memory of written.memories) {
-									if (memory.duplicate === true || memory.state !== "ACTIVE") continue;
-									host.api.mutateMemory({ memoryId: memory.id, idempotencyKey: `quarantine:${memory.id}`, expectedVersion: memory.version, actor, reason: "written in a turn that held only member reports", transition: "QUARANTINED" });
-								}
-								return { ...written, memories: written.memories.map((memory) => store.getMemory(memory.id) ?? memory) };
-							}
-							return written;
-						}));
+						const { result, vault } = await rememberHeld(host, input, actor, who.reportOnly, "written in a turn that held only member reports");
 						const first = result.memories[0]!;
 						const held = who.reportOnly && first.state === "QUARANTINED";
 						const capacity = store.memoryUsage(scope, input.project);
