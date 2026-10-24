@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
+import { allowEntryProblem, piAgentDir } from "./config.ts";
 import {
 	AgentDoc, createEditTool, createReadTool, createWriteTool, createBashTool, ctx, defineExtension, hook, isTaskLive, ROOT, ToolTask, wrapTool,
 	type BashPrepare, type Extension, type HarnessType, type HookApi, type ToolRegistration,
 } from "./durable.ts";
-import { canonicalize, isInside, PathRefused, samePath } from "./paths.ts";
+import { canonicalize, isInside, PathRefused, samePath, segments } from "./paths.ts";
 import { clipShellOutput } from "./shell.ts";
 import { capture, captureLost, countBash, recordPost } from "./undo.ts";
 
@@ -19,6 +20,10 @@ import { capture, captureLost, countBash, recordPost } from "./undo.ts";
 // - basename rules: .env, .env.local and .env.*.local are denied anywhere. .envrc and env.ts are not.
 // - read exception (checkRead, the read tool only): files under <home>/skills may be read, secret names excepted.
 //   write, edit, find and grep, and every other deny root, keep the strict checkPath.
+// - allow (settings.guard.allow, P27f): a project folder opened inside one deny root, for read, write, edit, find and grep.
+//   An entry counts only when allowEntryProblem accepts it and no link or junction lies in its path below the deny root;
+//   it lifts only the first deny root that contains it, so every other root, and any deny root inside it, still refuse.
+//   Inside it WIDE_SECRET names, .aws/.ssh/.gnupg folders and (for write and edit) .git folders are refused.
 // - shell: only an allowlisted environment reaches the child, and every call carries a timeout no larger
 //   than shellTimeoutMs (the guard is the only place that rewrites tool arguments).
 // - read before write: write and edit to an existing file are refused unless this conversation read it and the
@@ -35,6 +40,10 @@ export interface GuardConfig {
 	profile?: string;
 	/** settings.guard.deny. */
 	deny: readonly string[];
+	/** settings.guard.allow. */
+	allow: readonly string[];
+	/** Notice for an allow entry that is ignored; the caller shows each text once. */
+	warn?(message: string): void;
 	/** Cap for every shell call, in milliseconds. */
 	shellTimeoutMs: number;
 	/** settings.shellEnvAllow, added to the built-in allowlist. */
@@ -77,7 +86,10 @@ const ENV_BASENAME = [/^\.env$/iu, /^\.env\.local$/iu, /^\.env\..+\.local$/iu];
 
 export function denyRoots(config: GuardConfig): string[] {
 	const profile = config.profile ?? homedir();
-	return [config.home, join(profile, ".pi"), join(profile, ".ssh"), join(profile, ".claude"), ...config.deny];
+	const pi = join(profile, ".pi");
+	// A PI_CODING_AGENT_DIR outside <profile>/.pi holds the same credentials, so it is a deny root too.
+	const agent = piAgentDir(profile);
+	return [config.home, pi, join(profile, ".ssh"), join(profile, ".claude"), ...(isInside(resolve(pi), agent) ? [] : [agent]), ...config.deny];
 }
 
 // A verb counts when no word character or hyphen touches it on either side, so `skill`, `killer` and `kill-port` pass
@@ -108,12 +120,60 @@ function homeSkillsRead(target: string, base: string, config: GuardConfig): bool
 	return samePath(skills, join(canonicalize(config.home), "skills")) && isInside(skills, target) && !SECRET_BASENAME.some((pattern) => pattern.test(base));
 }
 
-function evaluate(path: unknown, cwd: string | undefined, config: GuardConfig, read: boolean): PathVerdict {
+// Names refused inside an allowed folder: the secret names above plus whole-basename credential files (source files such as tokenizer.ts stay open).
+export const WIDE_SECRET = [
+	...SECRET_BASENAME,
+	/^\.env\.(?!(?:example|sample|template)$).+/iu, /^\.envrc$/iu, /^_netrc$/iu, /^\.git-credentials$/iu, /^\.pypirc$/iu, /\.db$/iu, /^mcp-auth\.json$/iu,
+	/^credentials(?:\.(?:json|yaml|yml|toml|ini|csv|xml))?$/iu, /^tokens?(?:\.(?:json|txt|yaml|yml))?$/iu, /^secrets?(?:\.(?:json|yaml|yml|toml|env|txt))?$/iu, /^service-account.*\.json$/iu,
+];
+const SECRET_DIRS = new Set([".aws", ".ssh", ".gnupg"]);
+
+/** An allow entry that counts: its canonical entry and the index of the one deny root it lifts. Others are ignored with a notice. */
+function allowedFolders(config: GuardConfig): { entry: string; at: number }[] {
+	if (config.allow.length === 0) return [];
+	const profile = config.profile ?? homedir();
+	const roots = denyRoots(config);
+	const barred = [config.home, join(profile, ".ssh"), join(profile, ".claude")];
+	const out: { entry: string; at: number }[] = [];
+	for (const entry of config.allow) {
+		const ignore = (why: string): void => config.warn?.(`guard.allow: ${entry} is ignored: ${why}`);
+		const problem = allowEntryProblem(entry, config.deny, profile, config.home);
+		if (problem !== undefined) { ignore(problem); continue; }
+		const lexical = resolve(entry);
+		const at = roots.findIndex((root) => isInside(resolve(root), lexical) && !samePath(resolve(root), lexical));
+		if (at < 0) continue;
+		try {
+			// No link or junction anywhere below the deny root: the canonical entry is the lexical one resolved against the canonical root.
+			const entryReal = canonicalize(lexical);
+			if (!samePath(entryReal, join(canonicalize(roots[at]!), relative(resolve(roots[at]!), lexical)))) { ignore("a link or junction lies in its path"); continue; }
+			if (barred.some((root) => isInside(canonicalize(root), entryReal))) { ignore("it resolves into the piroboros data directory, ~/.ssh or ~/.claude"); continue; }
+			out.push({ entry: entryReal, at });
+		} catch { ignore("it could not be evaluated"); }
+	}
+	return out;
+}
+
+/** The notices for allow entries that do not count; the runtime calls it at start so the user sees them before the first tool call. */
+export function checkAllowEntries(config: GuardConfig): void {
+	allowedFolders(config);
+}
+
+// Names refused inside an allowed folder `entry`, or undefined.
+function allowedNameRefusal(entry: string, target: string, base: string, write: boolean): string | undefined {
+	const below = segments(relative(entry, target));
+	if (WIDE_SECRET.some((pattern) => pattern.test(base))) return "that file name looks like a credential file";
+	if (below.some((part) => SECRET_DIRS.has(part))) return "that folder holds credentials";
+	if (write && below.includes(".git")) return "the .git folder is not writable by tools";
+	return undefined;
+}
+
+function evaluate(path: unknown, cwd: string | undefined, config: GuardConfig, read: boolean, write = false): PathVerdict {
 	try {
 		if (typeof path !== "string") return { allowed: false, reason: "the path argument is missing or not text" };
 		const target = canonicalize(path, cwd);
 		const base = target.split(/[\\/]/u).pop() ?? "";
 		if (ENV_BASENAME.some((pattern) => pattern.test(base))) return { allowed: false, reason: "environment files (.env) are not accessible to tools" };
+		const folders = allowedFolders(config);
 		for (const [at, root] of denyRoots(config).entries()) {
 			let canonicalRoot: string;
 			try {
@@ -121,8 +181,14 @@ function evaluate(path: unknown, cwd: string | undefined, config: GuardConfig, r
 			} catch {
 				return { allowed: false, reason: "a protected location could not be evaluated" };
 			}
+			if (!isInside(canonicalRoot, target)) continue;
 			// The exception is for the home root only (the first deny root), per root: every other deny root still refuses a path inside it.
-			if (isInside(canonicalRoot, target) && !(read && at === 0 && homeSkillsRead(target, base, config))) return { allowed: false, reason: "that location holds credentials or application data and is protected" };
+			if (read && at === 0 && homeSkillsRead(target, base, config)) continue;
+			// An allowed folder lifts the one root it sits in; any other root that holds the target, or sits inside the folder, still refuses.
+			const folder = folders.find((f) => f.at === at && isInside(f.entry, target));
+			if (folder === undefined) return { allowed: false, reason: "that location holds credentials or application data and is protected" };
+			const refusal = allowedNameRefusal(folder.entry, target, base, write);
+			if (refusal !== undefined) return { allowed: false, reason: refusal };
 		}
 		return { allowed: true };
 	} catch (error) {
@@ -131,8 +197,8 @@ function evaluate(path: unknown, cwd: string | undefined, config: GuardConfig, r
 }
 
 /** Decide whether a tool may touch `path`. Any failure to evaluate the path is a refusal. */
-export function checkPath(path: unknown, cwd: string | undefined, config: GuardConfig): PathVerdict {
-	return evaluate(path, cwd, config, false);
+export function checkPath(path: unknown, cwd: string | undefined, config: GuardConfig, write = false): PathVerdict {
+	return evaluate(path, cwd, config, false, write);
 }
 
 /** checkPath for reading: also allows files under <home>/skills (the user's installed skills), secrets excluded. Writes never use it. */
@@ -260,7 +326,7 @@ export function createGuard(deps: GuardDeps): Guard {
 		let cwd: string | undefined;
 		if (PATH_TOOLS.has(call.name)) {
 			try { cwd = (await api.snapshot(AgentDoc, api.conversationId, ctx))?.cwd; } catch { cwd = undefined; }
-			const verdict = call.name === "read" ? checkRead(args.path, cwd, config) : checkPath(args.path, cwd, config);
+			const verdict = call.name === "read" ? checkRead(args.path, cwd, config) : checkPath(args.path, cwd, config, WRITE_TOOLS.has(call.name));
 			if (!verdict.allowed) return { block: `blocked by guard: ${verdict.reason}` };
 			if (id !== (ROOT as number)) {
 				const inside = contained(args.path, cwd);

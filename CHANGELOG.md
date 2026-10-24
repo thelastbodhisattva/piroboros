@@ -2,6 +2,17 @@
 
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `guard.allow`: project folders opened inside a protected location, at or inside the pi extensions folder or strictly inside a `guard.deny` root. Credential file names stay refused inside them. A security setting, confirmed on change.
+- `PI_CODING_AGENT_DIR` outside `~/.pi` is protected like `~/.pi`.
+
+### Fixed
+
+- The WSL `bash.exe` alias in `WindowsApps` is never chosen as the shell.
+
 ## [0.2.0] - 2026-10-24
 
 ### Added

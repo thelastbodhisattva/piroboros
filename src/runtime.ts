@@ -12,7 +12,7 @@ import { MemoryHost, type MemoryStatus } from "./memory/host.ts";
 import { createAkashicTool } from "./memory/akashic/tools.ts";
 import { createMnemosiaTools } from "./memory/mnemosia/tools.ts";
 import type { VaultChildRunner } from "./memory/akashic/vault.ts";
-import { checkRead, conversationsWithoutGuardFirst, createGuard, type Guard, type GuardConfig, type PipelineState } from "./guard.ts";
+import { checkAllowEntries, checkRead, conversationsWithoutGuardFirst, createGuard, type Guard, type GuardConfig, type PipelineState } from "./guard.ts";
 import { createSearch, type Search, type SearchDeps } from "./search.ts";
 import { createSkills, type Skills } from "./skills.ts";
 import { contextCheck, createAppModels, resolveModel, type CustomProviders, type Models, type Provider } from "./models.ts";
@@ -155,7 +155,8 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 	const PLANNING_NOTE = "planning applies at the next start, because the tool list stays fixed while piroboros runs";
 	// Throws on a refused or invalid write. `planningOn` and `loop` are set by the time a chat command calls this.
 	const applySettings = (change: SettingsChange): string | undefined => {
-		settings = "unset" in change ? unsetSettings(options.home, change.unset) : mergeSettings(options.home, change.set);
+		const profile = options.profile ?? profileDir();
+		settings = "unset" in change ? unsetSettings(options.home, change.unset, profile) : mergeSettings(options.home, change.set, profile);
 		// A new global thinking-steps value replaces the session choice, so it shows at once.
 		if ("unset" in change ? change.unset === "tui.thinkingSteps" : change.set.tui?.thinkingSteps !== undefined) thinking.clearSession();
 		loop.wake();
@@ -177,9 +178,10 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 		}
 	};
 
+	const allowWarned = new Set<string>();
 	const guardConfig = (): GuardConfig => {
 		const d = withDefaults(settings);
-		return { home: options.home, profile: options.profile ?? profileDir(), deny: d.guardDeny, shellTimeoutMs: d.shellTimeoutMs, shellEnvAllow: d.shellEnvAllow };
+		return { home: options.home, profile: options.profile ?? profileDir(), deny: d.guardDeny, allow: d.guardAllow, warn: (message) => { if (!allowWarned.has(message)) { allowWarned.add(message); options.onStatus?.({ kind: "notice", message }); } }, shellTimeoutMs: d.shellTimeoutMs, shellEnvAllow: d.shellEnvAllow };
 	};
 	// F7: liveness comes from the pipeline task through the harness (isTaskLive). F3: the turn's origin is read from the turn state.
 	const guard = createGuard({
@@ -188,6 +190,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 		reportOnly: async () => (await harness.snapshot(TurnStateDoc, ctx))?.reportOnly === true,
 		warn: (message) => options.onStatus?.({ kind: "notice", message }),
 	});
+	checkAllowEntries(guardConfig());
 	const search = createSearch({ home: options.home, guard: guardConfig, ...(options.search ?? {}) });
 	const base: Extension = createBase([...guard.tools(), ...search.tools]);
 	// Skills are scanned once here and again on /reload. A skill file is opened only if the guard would let the read tool open it.

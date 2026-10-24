@@ -1,7 +1,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, parse } from "node:path";
+import { isAbsolute, join, parse, resolve } from "node:path";
 import { canonicalize, isInside, samePath, segments } from "./paths.ts";
 
 // Home directory, config files, settings schema and config integrity. Every filesystem path piroboros
@@ -172,7 +172,8 @@ export interface Settings {
 	cacheRetention?: "short" | "long";
 	shellEnvAllow?: string[];
 	shellTimeoutMs?: number;
-	guard?: { deny?: string[] };
+	/** deny: more protected roots. allow: project folders opened inside a deny root (P27f). */
+	guard?: { deny?: string[]; allow?: string[] };
 	tui?: { thinkingSteps?: string };
 	/** The plan tool (H5). Default true; false removes the tool and its injection at the next start. */
 	planning?: boolean;
@@ -282,8 +283,12 @@ export function validateSettings(value: unknown): Settings {
 	if (value.guard !== undefined) {
 		if (!isObj(value.guard)) issues.push("guard: must be an object");
 		else {
-			known(value.guard, ["deny"], "guard");
+			known(value.guard, ["deny", "allow"], "guard");
 			if (value.guard.deny !== undefined && !(Array.isArray(value.guard.deny) && value.guard.deny.every((item) => typeof item === "string" && isAbsolute(item)))) issues.push("guard.deny: must be an array of absolute paths");
+			// Structural only: the profile-dependent rules (allowEntryProblem) run on save and at use, so a settings.json moved between machines still loads.
+			const { allow, deny } = value.guard;
+			if (allow !== undefined && !(Array.isArray(allow) && allow.every((item) => typeof item === "string" && isAbsolute(item)))) issues.push("guard.allow: must be an array of absolute paths");
+			else if (Array.isArray(allow) && Array.isArray(deny) && allow.some((item: string) => deny.some((root) => typeof root === "string" && isAbsolute(root) && samePath(resolve(root), resolve(item))))) issues.push("guard.allow: an entry equals a guard.deny entry");
 		}
 	}
 	if (value.web !== undefined) {
@@ -330,6 +335,7 @@ export function withDefaults(settings: Settings) {
 		shellEnvAllow: settings.shellEnvAllow ?? [],
 		shellTimeoutMs: settings.shellTimeoutMs ?? SETTINGS_DEFAULTS.shellTimeoutMs,
 		guardDeny: settings.guard?.deny ?? [],
+		guardAllow: settings.guard?.allow ?? [],
 		planning: settings.planning ?? true,
 		telemetry: settings.telemetry ?? SETTINGS_DEFAULTS.telemetry,
 		web: {
@@ -370,7 +376,7 @@ export const SETTINGS_CHANGED = "settings.json changed outside piroboros; run /r
  * The only settings write. It refuses when the file is not what piroboros last wrote (or was never recorded),
  * then applies `edit`, validates, writes atomically and records the hash of the string it wrote.
  */
-function checkedWrite(home: string, edit: (current: Obj) => Obj): Settings {
+function checkedWrite(home: string, edit: (current: Obj) => Obj, profile: string): Settings {
 	const path = homePaths(home).settings;
 	let text: string | undefined;
 	try {
@@ -385,7 +391,7 @@ function checkedWrite(home: string, edit: (current: Obj) => Obj): Settings {
 	} catch (error) {
 		throw new ConfigError("json_invalid", `${path} is not valid JSON: ${(error as Error).message}`);
 	}
-	const merged = validateSettings(edit(isObj(current) ? current : {}));
+	const merged = checkAllow(validateSettings(edit(isObj(current) ? current : {})), isObj(current) ? (current as Settings) : undefined, profile, home);
 	const written = `${JSON.stringify(merged, null, 2)}\n`;
 	writeTextAtomic(path, written, 0o600);
 	const record = readIntegrity(home);
@@ -394,9 +400,40 @@ function checkedWrite(home: string, edit: (current: Obj) => Obj): Settings {
 	return merged;
 }
 
+/** The pi agent dir: PI_CODING_AGENT_DIR when it is set and absolute, otherwise <profile>/.pi/agent. */
+export function piAgentDir(profile: string, env: NodeJS.ProcessEnv = process.env): string {
+	const set = env.PI_CODING_AGENT_DIR;
+	return set !== undefined && isAbsolute(set) ? resolve(set) : join(profile, ".pi", "agent");
+}
+
+/**
+ * Why `entry` may not be a guard.allow entry, or undefined. Lexical after path.resolve (no filesystem access): it must be
+ * at or inside <agent dir>/extensions, or strictly inside a guard.deny root, and never at or inside the piroboros home,
+ * ~/.ssh or ~/.claude. The guard repeats the check at use and adds the link test.
+ */
+export function allowEntryProblem(entry: string, deny: readonly string[], profile: string, home: string): string | undefined {
+	if (!isAbsolute(entry)) return "must be an absolute path";
+	const at = resolve(entry);
+	if ([home, join(profile, ".ssh"), join(profile, ".claude")].some((root) => isInside(resolve(root), at))) return "must not be inside the piroboros data directory, ~/.ssh or ~/.claude";
+	if (deny.some((root) => samePath(resolve(root), at))) return "equals a guard.deny entry";
+	if (isInside(join(piAgentDir(profile), "extensions"), at)) return undefined;
+	return deny.some((root) => isInside(resolve(root), at)) ? undefined : "must be at or inside the pi extensions folder, or strictly inside a guard.deny root";
+}
+
+/** `settings` unchanged, or a SettingsError naming each guard.allow entry that is new in it (against `before`) and fails allowEntryProblem. Old entries stay so any other key can still be saved. */
+function checkAllow(settings: Settings, before: Settings | undefined, profile: string, home: string): Settings {
+	const old = before?.guard?.allow ?? [];
+	const issues = (settings.guard?.allow ?? []).filter((entry) => !old.includes(entry)).flatMap((entry) => {
+		const problem = allowEntryProblem(entry, settings.guard?.deny ?? [], profile, home);
+		return problem === undefined ? [] : [`guard.allow: ${entry} ${problem}`];
+	});
+	if (issues.length > 0) throw new SettingsError(issues);
+	return settings;
+}
+
 /** Merges only the patched keys through the checked write. */
-export function mergeSettings(home: string, patch: Settings): Settings {
-	return checkedWrite(home, (current) => mergeDeep(current, patch as Obj));
+export function mergeSettings(home: string, patch: Settings, profile: string = profileDir()): Settings {
+	return checkedWrite(home, (current) => mergeDeep(current, patch as Obj), profile);
 }
 
 function unsetPath(obj: Obj, parts: string[]): Obj {
@@ -413,15 +450,15 @@ function unsetPath(obj: Obj, parts: string[]): Obj {
 }
 
 /** Removes one key by its dotted path, such as "tui.thinkingSteps", and any parent object left empty. */
-export function unsetSettings(home: string, path: string): Settings {
-	return checkedWrite(home, (current) => unsetPath(current, path.split(".")));
+export function unsetSettings(home: string, path: string, profile: string = profileDir()): Settings {
+	return checkedWrite(home, (current) => unsetPath(current, path.split(".")), profile);
 }
 
 export type SettingsChange = { set: Settings } | { unset: string };
 
 /** The settings a change would produce, validated. Throws SettingsError when the result is invalid. Nothing is written. */
-export function previewSettings(current: Settings, change: SettingsChange): Settings {
-	return validateSettings("unset" in change ? unsetPath(current as Obj, change.unset.split(".")) : mergeDeep(current as Obj, change.set as Obj));
+export function previewSettings(current: Settings, change: SettingsChange, profile: string = profileDir(), home: string = process.env.PIROBOROS_HOME || defaultHome(profile)): Settings {
+	return checkAllow(validateSettings("unset" in change ? unsetPath(current as Obj, change.unset.split(".")) : mergeDeep(current as Obj, change.set as Obj)), current, profile, home);
 }
 
 /** The value at a dotted path such as "web.search.provider", or undefined. */
@@ -468,6 +505,7 @@ function securityKeys(settings: unknown): Record<string, unknown> {
 		shellEnvAllow: settings.shellEnvAllow,
 		shellTimeoutMs: settings.shellTimeoutMs,
 		"guard.deny": isObj(settings.guard) ? settings.guard.deny : undefined,
+		"guard.allow": isObj(settings.guard) ? settings.guard.allow : undefined,
 		"web.enabled": isObj(settings.web) ? settings.web.enabled : undefined,
 		"web.maxFetches": isObj(settings.web) ? settings.web.maxFetches : undefined,
 		"web.maxSearches": isObj(settings.web) ? settings.web.maxSearches : undefined,
@@ -542,7 +580,7 @@ const field = (path: string, type: SettingType, applies: SettingApplies, extra: 
 	path, type, applies, security: SECURITY_KEYS.includes(path) || /^conclave\.members\.[a-z]+\.model$/u.test(path), ...extra,
 });
 
-/** Every leaf key of settings.json (56). A test checks it against validateSettings, securityKeys and the defaults. */
+/** Every leaf key of settings.json (58). A test checks it against validateSettings, securityKeys and the defaults. */
 export const SETTING_FIELDS: readonly SettingField[] = [
 	field("main", "ref", "turn", { role: "main" }),
 	field("thinking", "enum", "turn", { values: THINKING_LEVELS }),
@@ -566,6 +604,7 @@ export const SETTING_FIELDS: readonly SettingField[] = [
 	field("shellEnvAllow", "list", "now", { entry: "env" }),
 	field("shellTimeoutMs", "int", "now", { min: 1_000 }),
 	field("guard.deny", "list", "now", { entry: "path" }),
+	field("guard.allow", "list", "now", { entry: "path" }),
 	field("tui.thinkingSteps", "enum", "now", { values: THINKING_STEP_MODES }),
 	field("planning", "bool", "start"),
 	field("telemetry", "bool", "start"),

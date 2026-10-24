@@ -19,7 +19,11 @@ const APPLIES: Record<SettingApplies, string> = {
 	start: "applies at the next start",
 };
 
+// An allowed pi extensions folder is code that pi runs with your credentials.
+const ALLOW_WARNING = "An allowed folder inside the pi extensions folder holds code that pi runs with your credentials: review edits and merges there like code you install, and merge while pi is not running (or reload pi after).";
+
 const FIELD_HELP: Record<string, string> = {
+	"guard.allow": " A project folder opened inside a protected location, at or inside the pi extensions folder or strictly inside a guard.deny root. Credential file names stay refused inside it.",
 	cacheRetention: ' "short" keeps the prompt cache for about 5 minutes. "long" keeps it for an hour and costs more per cache write, so it pays off when you pause longer than 5 minutes between turns.',
 };
 
@@ -185,7 +189,7 @@ async function commit(rt: Runtime, io: SetupIO, f: SettingField, change: Setting
 		throw error;
 	}
 	if (lines.length > 0) {
-		io.notify("warn", lines.join("\n"));
+		io.notify("warn", (f.path === "guard.allow" ? [...lines, ALLOW_WARNING] : lines).join("\n"));
 		if (!(await io.confirm(SECURITY_CONFIRM, false))) return `${f.path} not changed`;
 	}
 	const result = rt.updateSettings(change);

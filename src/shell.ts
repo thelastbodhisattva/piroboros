@@ -2,11 +2,11 @@ import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import type { Context, ToolExecutionApi, ToolRegistration } from "./durable.ts";
 
-// The shell is bash on every platform. On Windows that is Git Bash. The WSL launcher in System32 is never used.
+// The shell is bash on every platform. On Windows that is Git Bash. The WSL launchers (System32, Sysnative and the WindowsApps alias) are never used.
 
 export const BASH_HINT = "Install Git for Windows (https://git-scm.com/download/win), which includes Git Bash. On Linux and macOS install bash from your package manager.";
 
-const isWslLauncher = (path: string): boolean => /[\\/](?:system32|sysnative)[\\/]bash\.exe$/iu.test(path);
+export const isWslLauncher = (path: string): boolean => /[\\/](?:system32|sysnative|microsoft[\\/]windowsapps)[\\/]bash\.exe$/iu.test(path);
 
 /** The bash executable to run commands with, or undefined when none is installed. */
 export function findBash(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): string | undefined {
