@@ -26,6 +26,11 @@ Hermes Agent (NousResearch/hermes-agent, commit 7162533)
   Design credit for the learning loop (src/learn.ts): periodic review of the conversation that proposes skills and
   short memories. The logic is reimplemented for piroboros; no source text or prompt text is copied.
 
+LayerFS (Ephemeral-AI-Lab/layerfs, commit 4497b0c)
+  MIT License, Copyright (c) 2026 Ephemeral-AI. Design credit and port of the merge decision model in src/ws/merge.ts and
+  src/ws/lww.ts: the three-way line merge with the rule that a chunk changed identically on both sides is taken
+  once, and the .lww last-writer-wins rule file. The filesystem, its Store and its runtime are not used.
+
 pi-fff v0.11.0
   MIT License, by dmtrKovalenko (@ff-labs/pi-fff).
   Used for: the find and grep output formatting in src/search-format.ts (file annotations, compact grep lines,
