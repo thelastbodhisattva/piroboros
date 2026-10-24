@@ -20,6 +20,7 @@ export const COMMANDS: readonly CommandInfo[] = [
 	{ name: "akashic", description: "memory status, accept and vault", args: "[status | accept | vault ...]" },
 	{ name: "thinking-steps", description: "choose how thinking steps are shown", args: "[mode | global <mode | clear>]" },
 	{ name: "skills", description: "list the skills the chat can use" },
+	{ name: "telemetry", description: "model requests, latency and cost of the last 24 hours" },
 ];
 
 /** A loaded skill, as the command table sees it. */

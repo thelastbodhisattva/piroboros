@@ -505,6 +505,7 @@ export function runCommand(rt: Runtime, text: string, ask?: (question: string) =
 		const started = sub === "approve" ? rt.conclave.approve() : rt.conclave.start(text.slice("/conclave".length));
 		return started.then((result) => (result.ok ? result.message : `not started: ${result.error}`));
 	}
+	if (name === "telemetry") return rt.telemetry();
 	if (name === "skills") return skillsReport(rt.skills.state(), COMMANDS.map((command) => command.name));
 	if (name === "akashic") return rt.akashic(rest.join(" "));
 	if (name === "thinking-steps") return thinkingStepsCommand(rt, rest);

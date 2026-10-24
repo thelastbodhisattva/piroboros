@@ -6,7 +6,8 @@ import {
 	type HomePaths, type IntegrityReport, type Settings, type SettingsChange,
 } from "./config.ts";
 import type { SetupEnv } from "./setup.ts";
-import { configure, createRegistry, ctx, defineExtension, onSessionFailed, openHarness, ROOT, SessionFailed, type Conversation, type Extension, type HarnessType, type Storage, type ToolExecutionApi } from "./durable.ts";
+import { configure, createRegistry, ctx, defineExtension, onSessionFailed, openHarness, parkedTasks, ROOT, SessionFailed, type Conversation, type Extension, type HarnessType, type ReportInfo, type Storage, type ToolExecutionApi } from "./durable.ts";
+import { openTelemetry, type Telemetry } from "./telemetry.ts";
 import { MemoryHost, type MemoryStatus } from "./memory/host.ts";
 import { createAkashicTool } from "./memory/akashic/tools.ts";
 import { createMnemosiaTools } from "./memory/mnemosia/tools.ts";
@@ -117,14 +118,20 @@ export interface Runtime {
 	/** /model: validate, write the merged setting; it applies at the next turn commit. */
 	setMain(ref: string): { ok: true } | { ok: false; error: string };
 	send(text: string): Promise<string>;
+	/** /telemetry: model requests of the last 24 hours. */
+	telemetry(): Promise<string>;
 	/** Resolves once, with the storage error, if the durable session fails. Never rejects, and never resolves after a normal close(). */
 	fatal: Promise<unknown>;
 	close(): Promise<void>;
 }
 
-function reportMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+function reportMessage(error: unknown, info?: ReportInfo): string {
+	const text = error instanceof Error ? error.message : String(error);
+	const source = info === undefined ? undefined : "task" in info && info.task !== undefined ? info.task.kind : "extension" in info ? info.extension : undefined;
+	return source === undefined ? text : `${source}: ${text}`;
 }
+
+const pausedText = (n: number): string => `${n === 1 ? "1 task" : `${n} tasks`} stopped without finishing on several starts in a row and ${n === 1 ? "is" : "are"} paused: Esc stops a paused reply, /conclave cancel a paused pipeline`;
 
 export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 	const paths = homePaths(options.home);
@@ -253,18 +260,26 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 	const planningOn = withDefaults(settings).planning;
 	const rootExtensions = [guard.extension, base, viewtools, ...(planningOn ? [planning] : []), memoryExtension, stuck, chat, skills.extension, budget];
 
+	// A failure to open the store turns telemetry off, visibly; the run goes on without it.
+	let telemetry: Telemetry | undefined;
+	if (withDefaults(settings).telemetry) {
+		try { telemetry = await openTelemetry(paths.telemetry); } catch (error) { report(`telemetry off: ${reportMessage(error)}`); }
+	}
 	const harness = await openHarness({
 		path: options.persistent === false ? undefined : paths.chat,
 		storage: options.storage,
+		telemetry: telemetry?.recorder,
 		models,
+		identity: { attribution: null },
 		registry,
 		settings: {
 			extensions: [guard.extension, base, viewtools, budget], steeringMode: "all", followUpMode: "all", compaction: { enabled: false, backgroundTokens: 0 },
 			// A getter: pi-durable reads it at every request, so /reload applies a changed cacheRetention at the next turn.
 			get stream() { return { cacheRetention: withDefaults(effective()).cacheRetention }; },
 		},
-		onReport: (error) => report(reportMessage(error)),
-	}).catch((error: unknown) => {
+		onReport: (error, info) => { if (info.type !== "task_parked") report(reportMessage(error, info)); },
+	}).catch(async (error: unknown) => {
+		await telemetry?.close().catch(() => undefined);
 		memory.close();
 		throw error;
 	});
@@ -292,6 +307,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 		if (offenders.length > 0) await root.configure({ extensions: rootExtensions }, ctx);
 	} catch (error) {
 		await harness.close(ctx);
+		await telemetry?.close().catch(() => undefined);
 		memory.close();
 		throw error;
 	}
@@ -310,6 +326,8 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 	});
 	// pi-durable resumes a live pipeline by itself. Say so, and forget one that ended while piroboros was closed.
 	await conclave.recover().catch((error: unknown) => report(reportMessage(error)));
+	const parked = await parkedTasks(harness);
+	if (parked.length > 0) options.onStatus?.({ kind: "notice", message: pausedText(parked.length) });
 
 	const compact = new CompactLoop({ harness, root, compactor, onAlarm: (text) => report(`alarm: ${text}`), onReport: (error) => report(reportMessage(error)) });
 	const loop = new TurnLoop({
@@ -399,6 +417,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 				throw error;
 			}
 		},
+		telemetry: async () => (telemetry === undefined ? "telemetry is off; /settings telemetry turns it on at the next start" : telemetry.summary()),
 		fatal,
 		async close() {
 			// Every step runs even when an earlier one throws; the errors are reported together.
@@ -411,6 +430,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 			await step(() => compact.stop());
 			await step(() => search.close());
 			await step(() => harness.close(ctx));
+			await step(() => telemetry?.close());
 			// Flush the briefing traces, then close the store. The tools can no longer run.
 			await step(() => mnemosia.close());
 			await step(() => memory.close());

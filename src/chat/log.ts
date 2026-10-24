@@ -10,7 +10,7 @@ import { NODE_TEXT_MAX, utf8Bytes } from "./view.ts";
 
 /** One-way door: a live log is never silently remapped. */
 export const MAPPING_VERSION = 3;
-const FRESH_START = "delete chat.sqlite in PIROBOROS_HOME to start fresh; auth.json and settings.json are kept";
+const FRESH_START = "delete chat.sqlite (and chat.schema1.sqlite, if there is one) in PIROBOROS_HOME to start fresh; auth.json and settings.json are kept";
 export const CHUNK = 1_024;
 export const SPLIT_CHARS = 30_000;
 export const PASS_ENTRIES = 256;

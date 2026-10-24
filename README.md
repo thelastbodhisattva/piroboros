@@ -92,7 +92,7 @@ Details: [The Conclave](docs/conclave.md).
 ```mermaid
 flowchart LR
   subgraph home["PIROBOROS_HOME on your machine"]
-    store[("chat database, auth.json, settings, memory, undo copies")]
+    store[("chat database, auth.json, settings, memory, telemetry, undo copies")]
   end
   home -->|"chat view"| mainp["Main model provider"]
   home -->|"scrubbed text"| compp["Compactor provider"]
@@ -114,6 +114,7 @@ A compactor on a third-party provider needs your consent (`compactor.allowThirdP
 | `--backup <file>` | Writes a copy of the chat database |
 | `/model`, `/settings`, `/login` | Change the main model, edit `settings.json`, sign in |
 | `/reload`, `/status` | Re-read the config files, show the view and cache state |
+| `/telemetry` | Model requests, latency and cost of the last 24 hours |
 | `/conclave <task>`, `approve`, `cancel`, `status`, `undo` | Run and control the Conclave |
 | `/akashic` | Memory and vault commands |
 | `/thinking-steps`, `/skills`, `/<skill-name>` | Thinking panel mode, skill list, run a skill |

@@ -2,15 +2,29 @@
 
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-24
 
-New features and bug fixes are planned for 2026-10-22.
+### Added
+
+- `/telemetry` and the `telemetry` setting. Model request and task timings are recorded to `telemetry.sqlite` in `PIROBOROS_HOME`, on by default, local only, with no message text and no error text. `"telemetry": false` stops it at the next start.
+- The first start copies the chat database to `chat.schema1.sqlite` before the schema 2 upgrade and checks the copy.
 
 ### Changed
 
+- Built on pi-durable, chord and pi-ai 1.4.0. The chat database moves to schema 2 on the first start, and 0.1.0 cannot open it after that. The start first copies it to `chat.schema1.sqlite`, so you can go back by restoring that copy.
+- piroboros sends no provider attribution headers. Requests still carry the pi-ai User-Agent.
+- Compactor retry waits survive a restart: closing piroboros during a wait no longer reruns the request.
+- Status line errors name the failing task or extension.
+- A task that was cut off on several starts in a row is paused. piroboros says so at every start, and Esc or `/conclave cancel` clears it.
 - The README is a short overview with diagrams of a turn, the Conclave and where data goes. The full reference moved to `docs/`, which ships in the package.
 - The turn state, plan, Conclave and node documents now store a full copy after every 64 changes, so a long chat no longer replays its whole change history each time one of them is read.
 - `--backup` writes to `<file>.tmp`, checks the copy with SQLite `quick_check` and only then renames it, so a failed backup never leaves a file under the final name.
+
+### Fixed
+
+- Windows shell lookup with an unusual `SystemRoot`.
+- Whitespace-only tool output was rejected by the OpenAI and Google providers.
+- Gateway `upstream_error` replies were not retried.
 
 ## [0.1.0] - 2026-10-17
 

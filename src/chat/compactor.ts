@@ -492,6 +492,7 @@ function makeTask(compactor: Compactor) {
 					const thinking = withDefaults(settings).compactor.thinking;
 					const reply = await runtime.models.completeSimple(model, { systemPrompt: scrub(compactor.systemPrompt()), messages }, {
 						signal: AbortSignal.any([runtime.signal, AbortSignal.timeout(compactor.requestTimeoutMs())]),
+						telemetry: context.telemetry,
 						maxTokens: model.maxTokens > 0 ? Math.min(model.maxTokens, 8_192) : 8_192,
 						...(thinking === "off" ? {} : { reasoning: thinking as never }),
 					});
@@ -514,9 +515,9 @@ function makeTask(compactor: Compactor) {
 								spend(q);
 								q.busy = (q.busy ?? 0) + 1;
 								q.lastError = message;
-								return { status: "running", checkpoint: { ...cp, busy } };
+								return { status: "sleeping", until: runtime.now() + compactor.busyBackoff(busy), checkpoint: { ...cp, busy } };
 							}, context);
-							return await runtime.sleep(runtime.now() + compactor.busyBackoff(busy), context);
+							return;
 						}
 						const errors = cp.errors + 1;
 						if (errors >= MAX_ERRORS) return await settle(runtime, context, task.input, spend, { error: `${message} (after ${errors} tries)` });
@@ -525,9 +526,9 @@ function makeTask(compactor: Compactor) {
 							spend(q);
 							q.retries += 1;
 							q.lastError = message;
-							return { status: "running", checkpoint: { ...cp, errors } };
+							return { status: "sleeping", until: runtime.now() + compactor.backoff(errors), checkpoint: { ...cp, errors } };
 						}, context);
-						return await runtime.sleep(runtime.now() + compactor.backoff(errors), context);
+						return;
 					}
 					const text = textOf(reply as never);
 					const calls = cp.calls + 1;

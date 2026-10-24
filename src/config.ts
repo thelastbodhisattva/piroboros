@@ -30,6 +30,7 @@ export interface HomePaths {
 	chat: string;
 	integrity: string;
 	skillsTrust: string;
+	telemetry: string;
 }
 
 export function homePaths(home: string): HomePaths {
@@ -45,6 +46,7 @@ export function homePaths(home: string): HomePaths {
 		chat: join(home, "chat.sqlite"),
 		integrity: join(home, "config-integrity.json"),
 		skillsTrust: join(home, "skills-trust.json"),
+		telemetry: join(home, "telemetry.sqlite"),
 	};
 }
 
@@ -174,6 +176,8 @@ export interface Settings {
 	tui?: { thinkingSteps?: string };
 	/** The plan tool (H5). Default true; false removes the tool and its injection at the next start. */
 	planning?: boolean;
+	/** Local request and task timings in telemetry.sqlite. Default true; false stops recording at the next start. */
+	telemetry?: boolean;
 	/** Web access for the Vaelia seat only (P8a). Off unless enabled is true. */
 	web?: { enabled?: boolean; maxFetches?: number; maxSearches?: number; search?: { provider?: "tinyfish" | "exa" }; allowHosts?: string[]; queryHosts?: string[] };
 }
@@ -187,6 +191,7 @@ export const SETTINGS_DEFAULTS = {
 	shellEnvAllow: [] as string[],
 	shellTimeoutMs: 600_000,
 	tui: { thinkingSteps: "summary" },
+	telemetry: true,
 	web: { enabled: false, maxFetches: 10, maxSearches: 5 },
 } as const;
 
@@ -229,7 +234,7 @@ export function validateSettings(value: unknown): Settings {
 			if (v !== undefined && (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max)) issues.push(`${path}: must be an integer from ${min}${max === Number.MAX_SAFE_INTEGER ? " up" : ` to ${max}`}`);
 		},
 	};
-	known(value, ["main", "thinking", "compactor", "conclave", "gateTimeoutMs", "cacheRetention", "shellEnvAllow", "shellTimeoutMs", "guard", "tui", "planning", "web"], "");
+	known(value, ["main", "thinking", "compactor", "conclave", "gateTimeoutMs", "cacheRetention", "shellEnvAllow", "shellTimeoutMs", "guard", "tui", "planning", "telemetry", "web"], "");
 	check.ref(value.main, "main");
 	check.level(value.thinking, "thinking");
 	if (value.compactor !== undefined) {
@@ -273,6 +278,7 @@ export function validateSettings(value: unknown): Settings {
 	if (value.shellEnvAllow !== undefined && !(Array.isArray(value.shellEnvAllow) && value.shellEnvAllow.every((item) => typeof item === "string" && /^[A-Za-z_][A-Za-z0-9_()]*$/u.test(item)))) issues.push("shellEnvAllow: must be an array of environment variable names");
 	check.int(value.shellTimeoutMs, "shellTimeoutMs", 1_000);
 	if (value.planning !== undefined && typeof value.planning !== "boolean") issues.push("planning: must be true or false");
+	if (value.telemetry !== undefined && typeof value.telemetry !== "boolean") issues.push("telemetry: must be true or false");
 	if (value.guard !== undefined) {
 		if (!isObj(value.guard)) issues.push("guard: must be an object");
 		else {
@@ -325,6 +331,7 @@ export function withDefaults(settings: Settings) {
 		shellTimeoutMs: settings.shellTimeoutMs ?? SETTINGS_DEFAULTS.shellTimeoutMs,
 		guardDeny: settings.guard?.deny ?? [],
 		planning: settings.planning ?? true,
+		telemetry: settings.telemetry ?? SETTINGS_DEFAULTS.telemetry,
 		web: {
 			enabled: settings.web?.enabled ?? SETTINGS_DEFAULTS.web.enabled,
 			maxFetches: settings.web?.maxFetches ?? SETTINGS_DEFAULTS.web.maxFetches,
@@ -561,6 +568,7 @@ export const SETTING_FIELDS: readonly SettingField[] = [
 	field("guard.deny", "list", "now", { entry: "path" }),
 	field("tui.thinkingSteps", "enum", "now", { values: THINKING_STEP_MODES }),
 	field("planning", "bool", "start"),
+	field("telemetry", "bool", "start"),
 	field("web.enabled", "bool", "run"),
 	field("web.maxFetches", "int", "now", { min: 1, max: 100 }),
 	field("web.maxSearches", "int", "now", { min: 1, max: 100 }),

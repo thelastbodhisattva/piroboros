@@ -1,5 +1,6 @@
-import { renameSync, rmSync } from "node:fs";
+import { existsSync, renameSync, rmSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { dirname, join } from "node:path";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { Context } from "@earendil-works/chord";
 import {
@@ -32,15 +33,18 @@ import {
 	type ToolExecutionApi,
 	type Extension,
 	type Harness as HarnessType,
+	type HarnessOptions,
 	type HarnessSettings,
 	type HookApi,
 	type Registry,
+	type ReportInfo,
 	type Storage,
 	type Submission,
 	type SubmissionRecord,
 	type TaskRecord,
 	type TaskRuntime,
 	type ToolRegistration,
+	type TaskInspection,
 	type Tx,
 	type UserInput,
 } from "@earendil-works/pi-durable";
@@ -57,7 +61,7 @@ export {
 	AgentDoc, BACKGROUND_CONTEXT, CompactionTask, configure, createBashTool, createEditTool, createReadTool, createRegistry, createWriteTool, defineDoc, defineDocFamily, defineEntry, defineExtension, defineTask, defineTool,
 	GenerationTask, hook, InboxDoc, LiveDoc, MemoryStorage, NodeExecutionEnv, openNodeSqliteStorage, ROOT_CONVERSATION_ID, section, SessionFailed, ToolTask, watchEvents, withCancel, wrapTool,
 };
-export type { Storage, AgentEvent,AgentEventStream, BashPrepare, Context, Conversation, EntryRecord, Extension, HarnessType, HarnessSettings, HookApi, Registry, Submission, SubmissionRecord, TaskRecord, TaskRuntime, ToolExecutionApi, ToolRegistration, Tx, UserInput };
+export type { Storage, AgentEvent,AgentEventStream, BashPrepare, Context, Conversation, EntryRecord, Extension, HarnessType, HarnessSettings, HookApi, Registry, ReportInfo, Submission, SubmissionRecord, TaskRecord, TaskRuntime, ToolExecutionApi, ToolRegistration, Tx, UserInput };
 
 export const ctx: Context = BACKGROUND_CONTEXT;
 export const ROOT = ROOT_CONVERSATION_ID;
@@ -79,7 +83,9 @@ export interface OpenOptions {
 	registry: Registry;
 	settings?: HarnessSettings;
 	env?: (cwd: string | undefined) => NodeExecutionEnv | undefined;
-	onReport?: (error: unknown) => void;
+	onReport?: (error: unknown, info: ReportInfo) => void;
+	telemetry?: HarnessOptions["telemetry"];
+	identity?: HarnessOptions["identity"];
 }
 
 /** Runs shell commands with the bash that findBash located, and stores their output without color codes. */
@@ -105,13 +111,15 @@ class ShellEnv extends NodeExecutionEnv {
 }
 
 export async function openHarness(options: OpenOptions): Promise<HarnessType> {
-	const storage = options.storage ?? (options.path === undefined ? new MemoryStorage() : await openNodeSqliteStorage(options.path));
+	const storage = options.storage ?? (options.path === undefined ? new MemoryStorage() : (backupBeforeSchema2(options.path), await openNodeSqliteStorage(options.path)));
 	return Harness.open(storage, {
 		models: options.models,
+		...(options.identity === undefined ? {} : { identity: options.identity }),
 		registry: options.registry,
 		settings: options.settings,
 		env: (target) => (options.env ? options.env(target.cwd) : new ShellEnv({ cwd: target.cwd ?? process.cwd(), shellPath: findBash() })),
 		onReport: options.onReport ?? (() => {}),
+		...(options.telemetry === undefined ? {} : { telemetry: options.telemetry }),
 	}, ctx);
 }
 
@@ -132,6 +140,33 @@ export function backupDatabase(source: string, target: string): void {
 		rmSync(tmp, { force: true });
 		throw error;
 	}
+}
+
+/** ponytail: one-time guard for the schema 1 to 2 migration of pi-durable main, after which 0.1.0 cannot open the chat database. Delete after 0.3.0. */
+function backupBeforeSchema2(path: string): void {
+	const target = join(dirname(path), "chat.schema1.sqlite");
+	if (target === path) throw new Error(`invariant: the chat database may not be named ${target}`);
+	if (!existsSync(path)) return;
+	const db = new DatabaseSync(path);
+	let version: unknown;
+	try {
+		const table = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'durable_schema'").get();
+		version = table === undefined ? undefined : (db.prepare("SELECT version FROM durable_schema WHERE singleton = 1").get() as { version?: unknown } | undefined)?.version;
+	} finally {
+		db.close();
+	}
+	if (version !== 1) return; // no table (new or empty file) or already schema 2: nothing to back up
+	if (existsSync(target)) throw new Error(`${target} is from an earlier upgrade and ${path} is schema 1 again; move ${target} somewhere else, then start piroboros again`);
+	try {
+		backupDatabase(path, target);
+	} catch (error) {
+		throw new Error(`could not back up the chat database before its schema 2 migration (if the disk is full, free space): ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+/** Tasks the restart limit parked (pi-durable main). They stay parked across starts until aborted or retried. */
+export async function parkedTasks(harness: Pick<HarnessType, "inspect">): Promise<TaskInspection["record"][]> {
+	return (await harness.inspect(ctx)).tasks.filter((t) => t.state.kind === "blocked" && t.state.reason === "restart_limit").map((t) => t.record);
 }
 
 /* --- named behaviors ---------------------------------------------------------------------------------- */
@@ -177,7 +212,7 @@ export function submitSteer(root: Conversation, content: UserInput, requestId: s
 	return root.submit({ type: "input", content, whenBusy: "steer", requestId }, ctx);
 }
 
-/** Every status but terminal is live, so a status this code does not know counts as live (fails closed). */
+/** Every status but "terminal" is live: pending, running, waiting, sleeping, completing. A status this code does not know, or a missing one, counts as live (fails closed). */
 export const isLiveStatus = (status: string | undefined): boolean => status !== "terminal";
 
 /**

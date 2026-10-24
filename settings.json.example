@@ -23,6 +23,7 @@
   "shellTimeoutMs": 600000,
   "guard": { "deny": [] },
   "planning": true,
+  "telemetry": true,
   "web": { "enabled": false, "maxFetches": 10, "maxSearches": 5, "search": { "provider": "tinyfish" }, "allowHosts": [], "queryHosts": [] },
   "tui": { "thinkingSteps": "summary" }
 }

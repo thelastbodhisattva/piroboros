@@ -226,7 +226,7 @@ export function createGuard(deps: GuardDeps): Guard {
 		if (conversationId !== ROOT) return "only the root conversation or the Vesperia child may write or run commands";
 		if (state?.taskId !== undefined) {
 			if (harness === undefined) return "the guard is not bound to a harness, so a live Conclave pipeline cannot be ruled out";
-			if (await isTaskLive(harness, state.taskId)) return "a Conclave pipeline is running; use /conclave cancel to stop it before writing from the root";
+			if (await isTaskLive(harness, state.taskId)) return "a Conclave pipeline is running or paused; use /conclave cancel to stop it before writing from the root";
 		}
 		// F3: reports are untrusted data. A turn made only of reports may not write or run commands until the user sends something.
 		try {
