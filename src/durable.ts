@@ -89,7 +89,7 @@ export interface OpenOptions {
 }
 
 /** Runs shell commands with the bash that findBash located, and stores their output without color codes. */
-class ShellEnv extends NodeExecutionEnv {
+export class ShellEnv extends NodeExecutionEnv {
 	override async exec(command: Parameters<NodeExecutionEnv["exec"]>[0], options: Parameters<NodeExecutionEnv["exec"]>[1], context: Parameters<NodeExecutionEnv["exec"]>[2]) {
 		// H2: the bash tool asks for a spill file once output passes its limits. Nothing is spilled: the file would
 		// hold a full copy of the output (and any secret in it) in %TEMP%. shell.ts clips oversized output instead.

@@ -177,7 +177,7 @@ export interface Settings {
 	/** deny: more protected roots. allow: project folders opened inside a deny root (P27f). */
 	guard?: { deny?: string[]; allow?: string[] };
 	/** Vesperia's Workspaces (P27d1). `enabled: false` runs her in place as 0.2.0 did; `nested` decides a project that is a repository subfolder, a worktree or a submodule. Both apply at the next /conclave approve. */
-	workspace?: { enabled?: boolean; nested?: "ask" | "copy" | "inplace" };
+	workspace?: { enabled?: boolean; nested?: "ask" | "copy" | "inplace"; confine?: "auto" | "none"; network?: boolean };
 	tui?: { thinkingSteps?: string };
 	/** The plan tool (H5). Default true; false removes the tool and its injection at the next start. */
 	planning?: boolean;
@@ -198,7 +198,7 @@ export const SETTINGS_DEFAULTS = {
 	shellTimeoutMs: 600_000,
 	tui: { thinkingSteps: "summary" },
 	telemetry: true,
-	workspace: { enabled: true, nested: "ask" },
+	workspace: { enabled: true, nested: "ask", confine: "auto", network: true },
 	web: { enabled: false, maxFetches: 10, maxSearches: 5 },
 } as const;
 
@@ -310,8 +310,10 @@ export function validateSettings(value: unknown): Settings {
 	if (value.workspace !== undefined) {
 		if (!isObj(value.workspace)) issues.push("workspace: must be an object");
 		else {
-			known(value.workspace, ["enabled", "nested"], "workspace");
+			known(value.workspace, ["enabled", "nested", "confine", "network"], "workspace");
 			check.bool(value.workspace.enabled, "workspace.enabled");
+			check.bool(value.workspace.network, "workspace.network");
+			if (value.workspace.confine !== undefined && !["auto", "none"].includes(value.workspace.confine as string)) issues.push('workspace.confine: must be "auto" or "none"');
 			if (value.workspace.nested !== undefined && !["ask", "copy", "inplace"].includes(value.workspace.nested as string)) issues.push('workspace.nested: must be "ask", "copy" or "inplace"');
 		}
 	}
@@ -537,6 +539,8 @@ function securityKeys(settings: unknown): Record<string, unknown> {
 		// Whether Vesperia writes live files directly (in place) is a trust decision.
 		"workspace.enabled": isObj(settings.workspace) ? settings.workspace.enabled : undefined,
 		"workspace.nested": isObj(settings.workspace) ? settings.workspace.nested : undefined,
+		"workspace.confine": isObj(settings.workspace) ? settings.workspace.confine : undefined,
+		"workspace.network": isObj(settings.workspace) ? settings.workspace.network : undefined,
 		"web.enabled": isObj(settings.web) ? settings.web.enabled : undefined,
 		"web.maxFetches": isObj(settings.web) ? settings.web.maxFetches : undefined,
 		"web.maxSearches": isObj(settings.web) ? settings.web.maxSearches : undefined,
@@ -611,7 +615,7 @@ const field = (path: string, type: SettingType, applies: SettingApplies, extra: 
 	path, type, applies, security: SECURITY_KEYS.includes(path) || /^conclave\.members\.[a-z]+\.model$/u.test(path), ...extra,
 });
 
-/** Every leaf key of settings.json (64). A test checks it against validateSettings, securityKeys and the defaults. */
+/** Every leaf key of settings.json (66). A test checks it against validateSettings, securityKeys and the defaults. */
 export const SETTING_FIELDS: readonly SettingField[] = [
 	field("main", "ref", "turn", { role: "main" }),
 	field("thinking", "enum", "turn", { values: THINKING_LEVELS }),
@@ -642,6 +646,8 @@ export const SETTING_FIELDS: readonly SettingField[] = [
 	field("guard.allow", "list", "now", { entry: "path" }),
 	field("workspace.enabled", "bool", "run"),
 	field("workspace.nested", "enum", "run", { values: ["ask", "copy", "inplace"] }),
+	field("workspace.confine", "enum", "run", { values: ["auto", "none"] }),
+	field("workspace.network", "bool", "run"),
 	field("tui.thinkingSteps", "enum", "now", { values: THINKING_STEP_MODES }),
 	field("planning", "bool", "start"),
 	field("telemetry", "bool", "start"),

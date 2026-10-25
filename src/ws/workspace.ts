@@ -5,6 +5,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { checkPath, checkRead, WIDE_SECRET, type GuardConfig } from "../guard.ts";
 import { canonicalize, isInside, samePath } from "../paths.ts";
 import { ConflictFound, HoldError, realFs, Writer, type Fs, type Row } from "./apply.ts";
+import { confineFor, nativeDeps, type Confine, type ConfineDeps } from "./confine.ts";
 import { BATCH_BYTES, Cas, GC_GRACE, OPEN_BATCH, pack, SNAPSHOT_MAX, type Packed } from "./cas.ts";
 import { HostGit, WsRefusal, type GitSpy, type GitState } from "./git.ts";
 import { lwwMatch, lwwRules, type LwwRule } from "./lww.ts";
@@ -12,7 +13,7 @@ import { decide, hasBlock, TEXT_MAX, type ConflictKind, type Side } from "./merg
 
 // Workspaces for Vesperia: one private copy of the git-visible files of a project per run, checkpointed into the CAS, merged
 // back three-way when her run ends `done`. The merge writes through ./apply.ts. Unconfined in P27d1: the Workspace keeps her
-// away from the live folder by convention and the start notice says so.
+// away from the live folder by convention and the start notice says so. P27e1 adds bubblewrap on Linux (./confine.ts).
 
 export { WsRefusal } from "./git.ts";
 export type Mode = "git" | "plain" | "none";
@@ -41,7 +42,9 @@ export interface WsOptions {
 	/** PIROBOROS_HOME: the store is ${home}/ws/store.sqlite. */
 	home: string;
 	guard(): GuardConfig;
-	settings(): { enabled: boolean; nested: "ask" | "copy" | "inplace" };
+	settings(): { enabled: boolean; nested: "ask" | "copy" | "inplace"; confine?: "auto" | "none"; network?: boolean };
+	/** Replaces parts of what confinement reads from the machine (probes). */
+	confineDeps?: Partial<ConfineDeps>;
 	notice(text: string): void;
 	/** Where Workspace folders live; default the per-platform folder. A probe puts it under its scratchpad. */
 	wsRoot?: string;
@@ -272,10 +275,11 @@ export class Workspaces {
 				if (same.mode === "git" && refs.length > 0 && (await this.git.missingObjects(project, refs)).length > 0) {
 					throw new WsRefusal(`the live repository no longer has objects this Workspace's git needs (pruned since ${new Date(same.created).toISOString().slice(0, 10)}); its files are intact: /conclave merge or /conclave discard still work.`);
 				}
+				const picked = await this.pick(same.folder);
 				const refreshed = await this.refreshLive(same).catch((error: unknown) => { this.o.notice(`the earlier Workspace could not be refreshed from ${project} (${msg(error)})`); return 0; });
-				this.cas.tx(() => { this.cas.db.prepare("UPDATE workspaces SET key = ?, conv = NULL, state = 'open', hold = NULL, hold_detail = NULL WHERE id = ?").run(key, same.id); });
+				this.cas.tx(() => { this.cas.db.prepare("UPDATE workspaces SET key = ?, conv = NULL, state = 'open', hold = NULL, hold_detail = NULL, confine = ? WHERE id = ?").run(key, JSON.stringify(picked.confine), same.id); });
 				if (same.conv !== null) this.byConv.delete(same.conv);
-				return { folder: same.folder, notice: [`Vesperia continues in her earlier Workspace of ${project} (${this.changedPaths(same.id).length} changed files${refreshed > 0 ? `; ${refreshed} you changed in your folder were refreshed` : ""})`] };
+				return { folder: same.folder, notice: [`Vesperia continues in her earlier Workspace of ${project} (${this.changedPaths(same.id).length} changed files${refreshed > 0 ? `; ${refreshed} you changed in your folder were refreshed` : ""})`, `Shell confinement: ${picked.label}.`, ...picked.notice] };
 			}
 			return this.copyIn(key, mode, project, plan);
 		});
@@ -417,10 +421,11 @@ export class Workspaces {
 			const refs = mode === "git" && state.kind === "tree" ? await this.git.refIds(project) : [];
 			if (refs.length > 0 && (await this.git.missingObjects(project, refs)).length > 0) refuse("the live repository is missing objects that its own refs name; run git fsck there first");
 			const objectIds = [...ents.values()].flatMap((e) => (e.object === null ? [] : [e.object]));
+			const picked = await this.pick(folder);
 			let baseId = 0;
 			this.cas.tx(() => {
 				if (this.cas.missing(objectIds).length > 0) throw new WsRefusal("the store dropped objects of this copy while it was made; approve again");
-				const confine = JSON.stringify({ name: "none" });
+				const confine = JSON.stringify(picked.confine);
 				this.cas.db.prepare("INSERT INTO workspaces(id, key, project, project_dev, project_ino, mode, git_head, refs, plan, folder, ws_caseless, live_caseless, confine, state, conv, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?)")
 					.run(id, key, project, String(dev.dev), String(dev.ino), mode, head, refs.length === 0 ? null : JSON.stringify(refs), plan, folder, wsCaseless ? 1 : 0, liveCaseless ? 1 : 0, confine, this.now());
 				baseId = Number(this.cas.db.prepare("INSERT INTO commits(workspace, parent, kind, at, note) VALUES (?, NULL, 'base', ?, 'open')").run(id, this.now()).lastInsertRowid);
@@ -435,8 +440,8 @@ export class Workspaces {
 			});
 			const list = (names: string[]): string => `${names.slice(0, 10).join(", ")}${names.length > 10 ? ` and ${names.length - 10} more` : ""}`;
 			const out: string[] = [
-				`Vesperia works in a Workspace copy of ${project} (${ents.size} files${links.length > 0 ? `, ${links.join(", ")} starts empty` : ""}${secrets.length > 0 ? `; left out: ${list(secrets)}` : ""}${skipped.length > 0 || missing.length > 0 ? `${secrets.length > 0 ? "," : "; left out:"} ${list([...skipped, ...missing.map((m) => `${m} (missing on disk)`)])}` : ""}; ${mode === "git" ? "with git" : state.kind === "tree" ? "without git: this folder is nested" : "without git"}). Shell confinement: none.`,
-				"WARNING: shell commands are not confined on this system. Vesperia's commands run in the Workspace folder but can still read and write any path your account can, including your live project.",
+				`Vesperia works in a Workspace copy of ${project} (${ents.size} files${links.length > 0 ? `, ${links.join(", ")} starts empty` : ""}${secrets.length > 0 ? `; left out: ${list(secrets)}` : ""}${skipped.length > 0 || missing.length > 0 ? `${secrets.length > 0 ? "," : "; left out:"} ${list([...skipped, ...missing.map((m) => `${m} (missing on disk)`)])}` : ""}; ${mode === "git" ? "with git" : state.kind === "tree" ? "without git: this folder is nested" : "without git"}). Shell confinement: ${picked.label}.`,
+				...picked.notice,
 			];
 			return { folder, notice: out };
 		} catch (error) {
@@ -624,6 +629,31 @@ export class Workspaces {
 	}
 
 	/* --- guard glue --------------------------------------------------------------------------------------------- */
+
+	private confineDeps(): ConfineDeps { return { ...nativeDeps(this.o.guard(), this.wsRoot), ...this.o.confineDeps }; }
+
+	/** The confinement backend for a Workspace folder, chosen at each open and reopen (4.3.1). */
+	private pick(folder: string): ReturnType<typeof confineFor> {
+		const s = this.o.settings();
+		return confineFor({ confine: s.confine ?? "auto", network: s.network ?? true }, this.confineDeps(), folder);
+	}
+
+	/** The open Workspace a shell cwd lies in, when its row names a backend: what ConfinedShellEnv wraps the command with. */
+	shellFor(cwd: string): { ws: string; confine: Confine; deps: ConfineDeps } | undefined {
+		for (const row of this.byConv.values()) {
+			if (row.state !== "open") continue;
+			try {
+				const confine = JSON.parse(row.confine) as Confine;
+				if (confine.name !== "none" && isInside(canonicalize(row.folder), canonicalize(cwd))) return { ws: row.folder, confine, deps: this.confineDeps() };
+			} catch { /* not this row */ }
+		}
+		return undefined;
+	}
+
+	/** Whether the project's open Workspace runs its shell confined (the brief says so). */
+	confinedFor(project: string): boolean {
+		try { return (JSON.parse(this.rows("project = ? AND state = 'open'", canonicalize(project))[0]?.confine ?? "{}") as Partial<Confine>).name === "bubblewrap"; } catch { return false; }
+	}
 
 	/** Whether the conversation runs in a Workspace. */
 	has(conv: number): boolean { return this.byConv.has(conv); }
@@ -1126,7 +1156,7 @@ export class Workspaces {
 		const w = this.rows("project = ?", canonicalize(project))[0];
 		if (w === undefined) return [];
 		const commits = Number((this.cas.db.prepare("SELECT COUNT(*) AS n FROM commits WHERE workspace = ? AND kind = 'checkpoint'").get(w.id) as { n: number }).n);
-		return [`Workspace ${w.id}: ${w.state}${w.hold === null ? "" : ` (${holdText(w.hold, w.hold_detail)})`}${parked ? " [task parked]" : ""}`, `  mode ${w.mode}${from === undefined ? "" : ` (${from})`}, folder ${w.folder}, ${commits} checkpoint${commits === 1 ? "" : "s"}`, "  shell confinement: none; commands are not confined"];
+		return [`Workspace ${w.id}: ${w.state}${w.hold === null ? "" : ` (${holdText(w.hold, w.hold_detail)})`}${parked ? " [task parked]" : ""}`, `  mode ${w.mode}${from === undefined ? "" : ` (${from})`}, folder ${w.folder}, ${commits} checkpoint${commits === 1 ? "" : "s"}`, (() => { const c = JSON.parse(w.confine) as Confine; return c.name === "bubblewrap" ? `  shell confinement: bubblewrap, network ${c.net === false ? "off" : "on"}` : `  shell confinement: none; commands are not confined${c.why === undefined ? "" : ` (${c.why})`}`; })()];
 	}
 
 	/* --- undo -------------------------------------------------------------------------------------------------- */

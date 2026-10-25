@@ -14,6 +14,8 @@ import { createMnemosiaTools } from "./memory/mnemosia/tools.ts";
 import type { VaultChildRunner } from "./memory/akashic/vault.ts";
 import { checkAllowEntries, checkRead, conversationsWithoutGuardFirst, createGuard, type Guard, type GuardConfig, type PipelineState } from "./guard.ts";
 import { createSearch, type Search, type SearchDeps } from "./search.ts";
+import { ConfinedShellEnv } from "./ws/confine.ts";
+import { findBash } from "./shell.ts";
 import { Workspaces, type WsOptions } from "./ws/workspace.ts";
 import { isInside, canonicalize } from "./paths.ts";
 import { join } from "node:path";
@@ -62,7 +64,7 @@ export interface RuntimeOptions {
 	/** Test seams for find and grep: the fff loader and the rg program. */
 	search?: Pick<SearchDeps, "loadFff" | "rg" | "holderBuilt">;
 	/** Test seams for Workspaces: where they live, the fs dependency, the clock, waits and a spy on git calls. */
-	workspace?: Pick<WsOptions, "wsRoot" | "fs" | "now" | "platform" | "sleep" | "gitSpy">;
+	workspace?: Pick<WsOptions, "wsRoot" | "fs" | "now" | "platform" | "sleep" | "gitSpy" | "confineDeps">;
 	/** Test seams for the Conclave: the definitions to load and a hook that runs at the start of each phase. */
 	conclave?: Pick<ConclaveDeps, "definitions" | "beforePhase">;
 	/** Test seams for the learning loop: a hook at the start of each phase and the request timeout. */
@@ -199,7 +201,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 	const notice = (message: string): void => options.onStatus?.({ kind: "notice", message });
 	const workspaces = new Workspaces({
 		home: options.home, guard: guardConfig, notice, ...options.workspace,
-		settings: () => { const w = withDefaults(settings).workspace; return { enabled: w.enabled, nested: w.nested }; },
+		settings: () => { const w = withDefaults(settings).workspace; return { enabled: w.enabled, nested: w.nested, confine: w.confine, network: w.network }; },
 	});
 	// F7: liveness comes from the pipeline task through the harness (isTaskLive). F3: the turn's origin is read from the turn state.
 	const guard = createGuard({
@@ -306,6 +308,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 			// A getter: pi-durable reads it at every request, so /reload applies a changed cacheRetention at the next turn.
 			get stream() { return { cacheRetention: withDefaults(effective()).cacheRetention }; },
 		},
+		env: (cwd) => new ConfinedShellEnv({ cwd: cwd ?? process.cwd(), shellPath: findBash() }, (c) => workspaces.shellFor(c)),
 		onReport: (error, info) => { if (info.type !== "task_parked") report(reportMessage(error, info)); },
 	}).catch(async (error: unknown) => {
 		await telemetry?.close().catch(() => undefined);

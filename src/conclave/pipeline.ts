@@ -731,8 +731,10 @@ export class Conclave {
 			"You work in a Workspace: a private copy of the project's git-visible files, kept outside the live folder. Your changes merge back into the project when your run ends with Verdict: done; they merge only then.",
 			input.workspace === "git" ? "git commits stay in the Workspace and push is disabled." : "This Workspace has no git repository: git commands here see none.",
 			"Git-ignored and secret-named paths are absent, and files you create at such paths are never merged.",
-			"node_modules is a link to the project's own. To install packages, first remove the link and install into a real folder; that folder is never merged.",
-			"Your shell is not confined: it can reach paths outside the Workspace, but write only inside it.",
+			"node_modules starts empty. Install packages into it when you need them (for example npm ci); it is never merged.",
+			this.deps.workspaces?.confinedFor(input.cwd)
+				? "Your shell is confined with bubblewrap: it can read most of the system, but a write outside the Workspace fails, or lands in /tmp or your hidden home folder and is discarded when the command ends (paths on PATH under your home stay visible)."
+				: "Your shell is not confined: it can reach paths outside the Workspace, but write only inside it.",
 		];
 		const lines = [
 			consolidating
