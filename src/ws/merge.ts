@@ -85,6 +85,11 @@ export function merge3Lines(base: string, ours: string, theirs: string, labels: 
 	return { text: out.join(""), hunks };
 }
 
+/** Whether `text` still holds a marker line labelled with this Workspace's id (a half-removed block counts); another id is ordinary text. */
+export function hasBlock(text: string, ws: number): boolean {
+	return new RegExp(`^(?:<<<<<<< workspace ${ws}|>>>>>>> live ${ws})\\r?$`, "mu").test(text);
+}
+
 /** One side of a path: its bytes, "dir" for a directory, undefined when absent. */
 export type Side = Uint8Array | "dir" | undefined;
 

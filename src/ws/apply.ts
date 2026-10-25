@@ -93,6 +93,9 @@ export class Writer {
 
 	/* --- io --------------------------------------------------------------------------------------------------- */
 
+	/** Drop the cached folder listings, so the next `name` reads the folder as it is now (a plan that follows the user's edits). */
+	forgetNames(): void { this.listings.clear(); }
+
 	private startPass(): void { this.exhausted = false; this.linkable.clear(); this.listings.clear(); }
 
 	/** Link, rename, unlink and rmdir retry EBUSY, EPERM and EACCES with async waits; a wait past 1 s shows a notice. */

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { checkPath, checkRead, WIDE_SECRET, type GuardConfig } from "../guard.ts";
@@ -7,7 +7,8 @@ import { canonicalize, isInside, samePath } from "../paths.ts";
 import { ConflictFound, HoldError, realFs, Writer, type Fs, type Row } from "./apply.ts";
 import { BATCH_BYTES, Cas, GC_GRACE, OPEN_BATCH, pack, SNAPSHOT_MAX, type Packed } from "./cas.ts";
 import { HostGit, WsRefusal, type GitSpy, type GitState } from "./git.ts";
-import { decide, TEXT_MAX, type ConflictKind, type Side } from "./merge.ts";
+import { lwwMatch, lwwRules, type LwwRule } from "./lww.ts";
+import { decide, hasBlock, TEXT_MAX, type ConflictKind, type Side } from "./merge.ts";
 
 // Workspaces for Vesperia: one private copy of the git-visible files of a project per run, checkpointed into the CAS, merged
 // back three-way when her run ends `done`. The merge writes through ./apply.ts. Unconfined in P27d1: the Workspace keeps her
@@ -56,7 +57,7 @@ export interface WsOptions {
 /** The files of a Workspace as the merge and the scan see them: path to hash, object (when stored), size and kind. */
 interface Ent { path: string; hash: string | null; object: string | null; size: number; kind: "file" | "link" | "skipped" }
 
-interface PlanConflict { path: string; kind: ConflictKind | "case"; ours: Buffer | null; oursSize: number; theirsHash: string | null; theirs: Buffer | null; liveSize: number; wsPath: string }
+interface PlanConflict { path: string; kind: ConflictKind | "case"; ours: Buffer | null; oursSize: number; theirsHash: string | null; theirs: Buffer | null; liveSize: number; wsPath: string; text?: string; lines?: number[] }
 interface Plan {
 	rows: Row[];
 	conflicts: PlanConflict[];
@@ -66,6 +67,10 @@ interface Plan {
 	deletes: number;
 	ignored: string[];
 	ignoreFailed: boolean;
+	/** `.lww` decisions: the rule and the side kept. */
+	lww: { path: string; rule: string; kept: "ours" | "theirs" }[];
+	/** Paths whose marker block was resolved: the next merge three-way merges them against the recorded live text. */
+	rebased: Set<string>;
 	changed: number;
 	redecide(row: Row, live: Buffer | null): Promise<"drop" | "conflict" | "oversize" | { row: Row }>;
 }
@@ -267,12 +272,35 @@ export class Workspaces {
 				if (same.mode === "git" && refs.length > 0 && (await this.git.missingObjects(project, refs)).length > 0) {
 					throw new WsRefusal(`the live repository no longer has objects this Workspace's git needs (pruned since ${new Date(same.created).toISOString().slice(0, 10)}); its files are intact: /conclave merge or /conclave discard still work.`);
 				}
+				const refreshed = await this.refreshLive(same).catch((error: unknown) => { this.o.notice(`the earlier Workspace could not be refreshed from ${project} (${msg(error)})`); return 0; });
 				this.cas.tx(() => { this.cas.db.prepare("UPDATE workspaces SET key = ?, conv = NULL, state = 'open', hold = NULL, hold_detail = NULL WHERE id = ?").run(key, same.id); });
 				if (same.conv !== null) this.byConv.delete(same.conv);
-				return { folder: same.folder, notice: [`Vesperia continues in her earlier Workspace of ${project} (${this.changedPaths(same.id).length} changed files)`] };
+				return { folder: same.folder, notice: [`Vesperia continues in her earlier Workspace of ${project} (${this.changedPaths(same.id).length} changed files${refreshed > 0 ? `; ${refreshed} you changed in your folder were refreshed` : ""})`] };
 			}
 			return this.copyIn(key, mode, project, plan);
 		});
+	}
+
+	/**
+	 * Reopen: every base path Vesperia never changed that the user changed live is copied into the Workspace (or removed when
+	 * the user deleted it) and a `refresh` commit makes the live bytes its new base. Changed and conflicted paths keep their base.
+	 */
+	private async refreshLive(row: WsRow): Promise<number> {
+		await this.scanNow(row);
+		const head = this.headOf(row.id);
+		const changed: { path: string; hash: string; size: number; mtime: number; link: boolean }[] = [];
+		const deleted: string[] = [];
+		const wsPath = (p: string): string => join(row.folder, ...p.split("/"));
+		const todo = [...this.baseOf(row.id)].filter(([p, b]) => b.kind === "file" && b.hash !== null && head.get(p)?.hash === b.hash);
+		await this.pool(todo, 16, async ([p, b]) => {
+			const live = await this.liveInfo(await this.writer.name(row.project, p, row.live_caseless === 1));
+			if (live.kind === "absent") { await this.fs.unlink(wsPath(p)).catch(() => undefined); deleted.push(p); return; }
+			if (live.kind !== "file" || live.hash === b.hash) return;
+			if (live.bytes !== undefined) await this.fs.writeFile(wsPath(p), live.bytes); else await this.fs.copyFile(join(row.project, ...p.split("/")), wsPath(p));
+			changed.push({ path: p, hash: live.hash, size: live.size, mtime: Math.floor((await this.fs.lstat(wsPath(p))).mtimeMs), link: false });
+		});
+		await this.checkpoint(row, changed, deleted, [], "refresh");
+		return changed.length + deleted.length;
 	}
 
 	/** Attach the Vesperia conversation to the Workspace of a key (inside the start commit, so a replay rewrites it). */
@@ -546,7 +574,7 @@ export class Workspaces {
 	}
 
 	/** Insert the changed paths as `checkpoint` commits, in batches by the CAS rule, each batch with its objects in one transaction. */
-	private async checkpoint(row: WsRow, changed: { path: string; hash: string; size: number; mtime: number; link: boolean }[], deleted: string[], touch: { path: string; size: number; mtime: number; hash: string }[]): Promise<void> {
+	private async checkpoint(row: WsRow, changed: { path: string; hash: string; size: number; mtime: number; link: boolean }[], deleted: string[], touch: { path: string; size: number; mtime: number; hash: string }[], kind: "checkpoint" | "refresh" = "checkpoint"): Promise<void> {
 		if (touch.length > 0) this.cas.tx(() => { const st = this.cas.db.prepare("UPDATE ws_stat SET size = ?, mtime = ? WHERE workspace = ? AND path = ?"); for (const t of touch) st.run(t.size, t.mtime, row.id, t.path); });
 		let batch: { c: (typeof changed)[number]; p?: Packed }[] = [];
 		let held = 0;
@@ -554,7 +582,7 @@ export class Workspaces {
 			this.cas.tx(() => {
 				this.cas.insert(list.flatMap((b) => (b.p === undefined ? [] : [b.p])));
 				const parent = (this.cas.db.prepare("SELECT head FROM workspaces WHERE id = ?").get(row.id) as { head: number }).head;
-				const id = Number(this.cas.db.prepare("INSERT INTO commits(workspace, parent, kind, at, note) VALUES (?, ?, 'checkpoint', ?, NULL)").run(row.id, parent, this.now()).lastInsertRowid);
+				const id = Number(this.cas.db.prepare("INSERT INTO commits(workspace, parent, kind, at, note) VALUES (?, ?, ?, ?, NULL)").run(row.id, parent, kind, this.now()).lastInsertRowid);
 				const entry = this.cas.db.prepare('INSERT INTO entries("commit", path, object, hash, size, kind) VALUES (?, ?, ?, ?, ?, ?)');
 				const stat = this.cas.db.prepare("INSERT INTO ws_stat VALUES (?, ?, ?, ?, ?) ON CONFLICT(workspace, path) DO UPDATE SET size = excluded.size, mtime = excluded.mtime, hash = excluded.hash");
 				for (const b of list) { entry.run(id, b.c.path, b.p?.id ?? null, b.c.hash, b.c.size, b.c.link ? "link" : "file"); stat.run(row.id, b.c.path, b.c.size, b.c.mtime, b.c.hash); }
@@ -614,19 +642,36 @@ export class Workspaces {
 
 	/* --- plan ------------------------------------------------------------------------------------------------- */
 
-	private async liveInfo(abs: string): Promise<{ kind: "absent" } | { kind: "dir" } | { kind: "link" } | { kind: "file"; hash: string; size: number; bytes?: Buffer }> {
+	private async liveInfo(abs: string): Promise<{ kind: "absent" } | { kind: "dir" } | { kind: "link" } | { kind: "file"; hash: string; size: number; mtime: number; bytes?: Buffer }> {
 		let info;
 		try { info = await this.fs.lstat(abs); } catch (error) { if (code(error) === "ENOENT" || code(error) === "ENOTDIR") return { kind: "absent" }; throw error; }
 		if (info.isDirectory()) return { kind: "dir" };
 		if (!info.isFile()) return { kind: "link" };
-		if (info.size <= TEXT_MAX) { const bytes = await this.fs.readFile(abs); return { kind: "file", hash: sha(bytes), size: bytes.length, bytes }; }
-		return { kind: "file", hash: await this.writer.hashFile(abs), size: info.size };
+		const mtime = Math.floor(info.mtimeMs);
+		if (info.size <= TEXT_MAX) { const bytes = await this.fs.readFile(abs); return { kind: "file", hash: sha(bytes), size: bytes.length, mtime, bytes }; }
+		return { kind: "file", hash: await this.writer.hashFile(abs), size: info.size, mtime };
 	}
 
 	private big(n: number): Uint8Array { return new Uint8Array(TEXT_MAX + 1).fill(n); }
 
-	/** Read the plan: the final scan, then a decision per path Vesperia changed. Nothing is written. */
+	/** The rules of the project folder's root `.lww` and its `%include` files (regular files inside the project, at most 64 KiB each). */
+	// ponytail: read with node:fs, not the injected fs; the file is small and only matched against paths.
+	private lwwFor(project: string): LwwRule[] {
+		const read = (file: string): string | undefined => {
+			try {
+				const p = resolve(project, file);
+				if (!isInside(project, p) || !lstatSync(p).isFile()) return undefined;
+				const b = readFileSync(p);
+				return b.length <= 65_536 ? b.toString("utf8") : undefined;
+			} catch { return undefined; }
+		};
+		const text = read(".lww");
+		return text === undefined ? [] : lwwRules(text, read);
+	}
+
+	/** Read the plan: the final scan, then a decision per path Vesperia changed. Housekeeping aside (resolved conflict rows are dropped), nothing is written. */
 	private async plan(row: WsRow): Promise<Plan> {
+		this.writer.forgetNames();
 		const scan = await this.scanNow(row);
 		const head = this.headOf(row.id);
 		const base = this.baseOf(row.id);
@@ -637,9 +682,14 @@ export class Workspaces {
 		const oversize: Plan["oversize"] = [];
 		const paths = this.changedPaths(row.id);
 		const label = `workspace ${row.id}`;
+		const rules = this.lwwFor(row.project);
+		const lww: Plan["lww"] = [];
+		const rebased = new Set<string>();
+		const old = new Map((this.cas.db.prepare("SELECT path, kind, ours, theirs FROM conflicts WHERE workspace = ?").all(row.id) as unknown as { path: string; kind: string; ours: string | null; theirs: string | null }[]).map((c) => [c.path, c]));
 		const entryOf = (p: string): Ent | undefined => { const e = head.get(p); return e === undefined || e.hash === null ? undefined : e; };
 		const baseEnt = (p: string): Ent | undefined => { const e = base.get(p); return e === undefined || e.hash === null ? undefined : e; };
-		const items = new Map<string, { ours: Ent | undefined; base: Ent | undefined; abs: string }>();
+		const wsAbs = (p: string): string => join(row.folder, ...p.split("/"));
+		const items = new Map<string, { ours: Ent | undefined; base: Ent | undefined; abs: string; over?: Buffer }>();
 		const sideOf = async (e: Ent | undefined, n: number, source: "ws" | "base", path: string): Promise<Side> => {
 			if (e === undefined) return undefined;
 			if (e.size > TEXT_MAX) return this.big(n);
@@ -656,13 +706,23 @@ export class Workspaces {
 			if (!checkPath(join(row.project, p), row.project, this.o.guard(), true).allowed) return "protected";
 			return undefined;
 		};
-		const todo: { path: string; ours: Ent | undefined; base: Ent | undefined }[] = [];
+		const todo: { path: string; ours: Ent | undefined; base: Ent | undefined; over?: Buffer }[] = [];
 		for (const p of paths) {
 			const ours = entryOf(p);
-			const b = baseEnt(p);
+			let b = baseEnt(p);
 			const why = refuseReason(p, ours, base.get(p));
 			if (why !== undefined) { left.push({ path: p, reason: why }); continue; }
-			todo.push({ path: p, ours, base: b });
+			// A path with a conflict row: while its marker block stands, Vesperia's version is the stored one; once resolved, the recorded live text is its base.
+			let over: Buffer | undefined;
+			const c = old.get(p);
+			if (c !== undefined && (c.kind === "content" || c.kind === "add/add") && c.theirs !== null) {
+				const mine = ours === undefined ? undefined : await this.fs.readFile(wsAbs(p)).catch(() => undefined);
+				const stored = c.ours === null ? undefined : this.cas.get(c.ours);
+				const recorded = this.cas.get(c.theirs);
+				if (mine !== undefined && stored !== undefined && hasBlock(mine.toString("utf8"), row.id)) over = stored;
+				else if (recorded !== undefined) { b = { path: p, hash: c.theirs, object: c.theirs, size: recorded.length, kind: "file" }; rebased.add(p); }
+			}
+			todo.push({ path: p, ours, base: b, ...(over === undefined ? {} : { over }) });
 		}
 		// Case-only renames: a delete of A and an add of B equal under case folding, with A unchanged live.
 		const renames = new Map<string, string>();
@@ -690,11 +750,12 @@ export class Workspaces {
 			}
 			return undefined;
 		};
-		const conflict = (path: string, kind: PlanConflict["kind"], ours: Ent | undefined, theirs?: { hash: string | null; bytes?: Buffer; size: number }): void => {
-			conflicts.push({ path, kind, ours: null, oursSize: ours?.size ?? 0, theirsHash: theirs?.hash ?? null, theirs: theirs?.bytes ?? null, liveSize: theirs?.size ?? 0, wsPath: join(row.folder, ...path.split("/")) });
+		const conflict = (path: string, kind: PlanConflict["kind"], ours: Ent | undefined, theirs?: { hash: string | null; bytes?: Buffer; size: number }, marked?: { text: string; lines: number[] }): void => {
+			conflicts.push({ path, kind, ours: null, oursSize: ours?.size ?? 0, theirsHash: theirs?.hash ?? null, theirs: theirs?.bytes ?? null, liveSize: theirs?.size ?? 0, wsPath: wsAbs(path), ...(marked === undefined ? {} : marked) });
 		};
 		const makeRow = (path: string, from: string | null, op: Row["op"], pre: string | null, post: string | null, extra: Partial<Row> = {}): Row => ({ seq: 0, path, from, op, pre, post, mode: null, ...extra });
-		const decideFor = async (path: string, ours: Ent | undefined, b: Ent | undefined, theirs: Awaited<ReturnType<Workspaces["liveInfo"]>>, abs: string): Promise<Row | "skip" | "oversize" | "conflict"> => {
+		const decideFor = async (path: string, entry: Ent | undefined, b: Ent | undefined, theirs: Awaited<ReturnType<Workspaces["liveInfo"]>>, abs: string, over?: Buffer): Promise<Row | "skip" | "oversize" | "conflict"> => {
+			const ours: Ent | undefined = over === undefined ? entry : { path, hash: sha(over), object: null, size: over.length, kind: "file" };
 			const theirHash = theirs.kind === "file" ? theirs.hash : null;
 			const theirSize = theirs.kind === "file" ? theirs.size : 0;
 			if (theirs.kind === "link") { left.push({ path, reason: "link" }); return "skip"; }
@@ -703,13 +764,16 @@ export class Workspaces {
 			const takeOurs = (): Row | "oversize" => {
 				if (theirs.kind === "file" && theirSize > SNAPSHOT_MAX) { oversize.push({ path, ws: join(row.folder, ...path.split("/")) }); return "oversize"; }
 				if (ours === undefined) return makeRow(path, null, "delete", theirHash, null, { preSize: theirSize });
-				if (theirs.kind === "absent") return makeRow(path, null, "create", null, ours.hash, { mode: oursMode, postSize: ours.size });
-				return makeRow(path, null, "write", theirHash, ours.hash, { mode: oursMode, preSize: theirSize, postSize: ours.size });
+				if (theirs.kind === "absent") return makeRow(path, null, "create", null, ours.hash, { mode: oursMode, postSize: ours.size, ...(over === undefined ? {} : { body: over }) });
+				return makeRow(path, null, "write", theirHash, ours.hash, { mode: oursMode, preSize: theirSize, postSize: ours.size, ...(over === undefined ? {} : { body: over }) });
 			};
 			if ((theirHash ?? null) === (b?.hash ?? null) && theirs.kind !== "dir") return takeOurs();
 			if (theirs.kind === "dir" || (ours !== undefined && theirs.kind === "absent" && (await dirFor(path)) !== undefined)) { conflict(path, "type", ours, { hash: theirHash, size: theirSize }); return "conflict"; }
 			// Both sides moved away from the base: the line merge, or a named conflict.
-			const d = decide(path, await sideOf(b, 3, "base", path), await sideOf(ours, 1, "ws", path), theirs.kind === "file" ? (theirs.bytes ?? this.big(2)) : undefined, { labels: [label, `live ${row.id}`] });
+			const rule = rules.length > 0 ? lwwMatch(rules, path) : null;
+			const times = rule === null ? undefined : { rules, ours: this.oursTime(row.id, path, ours !== undefined), theirs: theirs.kind === "file" ? theirs.mtime : -Infinity };
+			const d = decide(path, await sideOf(b, 3, "base", path), over ?? await sideOf(ours, 1, "ws", path), theirs.kind === "file" ? (theirs.bytes ?? this.big(2)) : undefined, { labels: [label, `live ${row.id}`], ...(times === undefined ? {} : { lww: times }) });
+			if ("lww" in d && d.lww !== undefined) lww.push({ path, ...d.lww });
 			void abs;
 			if (d.op === "skip") return "skip";
 			if (d.op === "ours") return takeOurs();
@@ -718,7 +782,7 @@ export class Workspaces {
 				if (theirs.kind === "file" && theirSize > SNAPSHOT_MAX) { oversize.push({ path, ws: join(row.folder, ...path.split("/")) }); return "oversize"; }
 				return makeRow(path, null, theirs.kind === "absent" ? "create" : "write", theirHash, sha(body), { mode: oursMode, preSize: theirSize, postSize: body.length, body });
 			}
-			conflict(path, d.kind, ours, { hash: theirHash, bytes: theirs.kind === "file" ? theirs.bytes : undefined, size: theirSize });
+			conflict(path, d.kind, ours, { hash: theirHash, bytes: theirs.kind === "file" ? theirs.bytes : undefined, size: theirSize }, d.text === undefined ? undefined : { text: d.text, lines: (d.hunks ?? []).map((h) => h.line) });
 			return "conflict";
 		};
 		const processed = new Set<string>();
@@ -727,10 +791,10 @@ export class Workspaces {
 			const abs = await this.writer.name(row.project, t.path, caseless);
 			const theirs = await this.liveInfo(abs);
 			live.set(t.path, theirs);
-			items.set(t.path, { ours: t.ours, base: t.base, abs });
+			items.set(t.path, { ours: t.ours, base: t.base, abs, ...(t.over === undefined ? {} : { over: t.over }) });
 			// A new path equal under case folding to a different live path is a case conflict.
 			if (caseless && t.ours !== undefined && t.base === undefined && !renames.has(t.path) && theirs.kind !== "absent" && relative(row.project, abs).replaceAll("\\", "/") !== t.path) { conflict(t.path, "case", t.ours, { hash: theirs.kind === "file" ? theirs.hash : null, size: 0 }); continue; }
-			const outcome = await decideFor(t.path, t.ours, t.base, theirs, abs);
+			const outcome = await decideFor(t.path, t.ours, t.base, theirs, abs, t.over);
 			if (typeof outcome !== "string") { rows.push(outcome); if (outcome.op !== "delete") created.set(t.path, rows.length - 1); }
 		}
 		for (const [bPath, aPath] of renames) {
@@ -755,16 +819,16 @@ export class Workspaces {
 		// Ours bytes for the conflicts, stored before anything else can change them.
 		for (const c of conflicts) {
 			const e = entryOf(c.path);
-			if (e !== undefined) c.ours = await this.fs.readFile(join(row.folder, ...c.path.split("/"))).catch(() => null);
+			if (e !== undefined) c.ours = items.get(c.path)?.over ?? await this.fs.readFile(wsAbs(c.path)).catch(() => null);
 		}
 		const plan: Plan = {
-			rows: ordered, conflicts, left, oversize, deletes: ordered.filter((r) => r.op === "delete").length, ignored: scan.ignoredNew, ignoreFailed: scan.ignoreFailed, changed: paths.length,
+			rows: ordered, conflicts, left, oversize, deletes: ordered.filter((r) => r.op === "delete").length, ignored: scan.ignoredNew, ignoreFailed: scan.ignoreFailed, lww, rebased, changed: paths.length,
 			redecide: async (r, bytes) => {
 				const item = items.get(r.path);
 				if (item === undefined || r.op === "rename" || r.op === "mkdir") return "conflict";
-				const theirs = bytes === null ? { kind: "absent" as const } : { kind: "file" as const, hash: sha(bytes), size: bytes.length, bytes };
+				const theirs = bytes === null ? { kind: "absent" as const } : { kind: "file" as const, hash: sha(bytes), size: bytes.length, mtime: this.now(), bytes };
 				const before = conflicts.length;
-				const out = await decideFor(r.path, item.ours, item.base, theirs, item.abs);
+				const out = await decideFor(r.path, item.ours, item.base, theirs, item.abs, item.over);
 				if (conflicts.length > before) { conflicts.pop(); return "conflict"; }
 				if (out === "oversize") return "oversize";
 				if (typeof out === "string") return "drop";
@@ -775,7 +839,17 @@ export class Workspaces {
 			const now = await this.git.head(row.project);
 			if ((now ?? "") !== row.git_head) plan.headMoved = { from: row.git_head, to: now ?? "" };
 		}
+		// A row whose path no longer conflicts (made equal to live, or Vesperia's change gone) is cleared; a resolved marker path keeps its row as the next base.
+		const keep = new Set([...conflicts.map((c) => c.path), ...rebased]);
+		const gone = [...old.keys()].filter((p) => !keep.has(p));
+		if (gone.length > 0) this.cas.tx(() => { const del = this.cas.db.prepare("DELETE FROM conflicts WHERE workspace = ? AND path = ?"); for (const p of gone) del.run(row.id, p); });
 		return plan;
+	}
+
+	/** The time Vesperia's side of a path was last modified, in integer milliseconds: its file's time at the last scan, or when the scan found it deleted. */
+	private oursTime(ws: number, path: string, present: boolean): number {
+		const sql = present ? "SELECT mtime AS t FROM ws_stat WHERE workspace = ? AND path = ?" : `SELECT c."at" AS t FROM entries e JOIN commits c ON c.id = e."commit" WHERE c.workspace = ? AND e.path = ? AND e.hash IS NULL ORDER BY c.id DESC LIMIT 1`;
+		return Number((this.cas.db.prepare(sql).get(ws, path) as { t: number } | undefined)?.t ?? 0);
 	}
 
 	/* --- merge ------------------------------------------------------------------------------------------------- */
@@ -786,6 +860,7 @@ export class Workspaces {
 			const out = [`Merged ${n} file${n === 1 ? "" : "s"} from the Workspace into ${row.project}`];
 			for (const l of LIMITED(plan.left.map((x) => `not merged: ${x.reason}: ${x.path}`))) out.push(l);
 			for (const o of plan.oversize) out.push(`not merged: over 64 MiB: ${o.path}`);
+			out.push(...this.lwwLines(plan.lww).map((l) => l.trim()));
 			if (plan.ignored.length > 0) out.push(`Vesperia also created ${plan.ignored.length} git-ignored paths (not merged): ${plan.ignored.slice(0, 10).join(", ")}`);
 			return out.join("\n");
 		};
@@ -793,7 +868,7 @@ export class Workspaces {
 			const oversized = plan.oversize.length > 0;
 			this.cas.tx(() => { this.set(row.id, { state: oversized ? "discarded" : "merged", hold: null, hold_detail: oversized ? "nothing left to merge" : "no changes" }); });
 			await this.removeFolder(row.folder).catch((error: unknown) => this.o.notice(`the Workspace folder could not be removed: ${msg(error)}`));
-			return { text: oversized ? `nothing merged: ${plan.oversize.length} changes over 64 MiB were left out; the Workspace was removed` : `Vesperia changed no files in ${row.project}; nothing was merged`, state: oversized ? "discarded" : "merged" };
+			return { text: [oversized ? `nothing merged: ${plan.oversize.length} changes over 64 MiB were left out; the Workspace was removed` : `Vesperia changed no files in ${row.project}; nothing was merged`, ...this.lwwLines(plan.lww).map((l) => l.trim())].join("\n"), state: oversized ? "discarded" : "merged" };
 		}
 		try {
 			const r = await this.writer.merge({ ws: row.id, project: row.project, folder: row.folder, run, caseless: row.live_caseless === 1, rows, head: summaryHead(), redecide: plan.redecide });
@@ -803,29 +878,39 @@ export class Workspaces {
 			return { text: r.summary, state: "held", record: r.id, code: "rollback" };
 		} catch (error) {
 			if (error instanceof HoldError) { this.hold(row.id, error.code, error.detail.replaceAll(", ", "\n")); return { text: `Merge held: ${holdText(error.code, error.detail)}`, state: "held", code: error.code }; }
-			if (error instanceof ConflictFound) return this.storeConflicts(row, await this.plan(row), "the live file changed again");
+			if (error instanceof ConflictFound) return await this.storeConflicts(row, await this.plan(row), "the live file changed again");
 			this.hold(row.id, "preflight", `${row.project}: ${msg(error)}`);
 			return { text: `Merge held: ${msg(error)}`, state: "held", code: "preflight" };
 		}
 	}
 
-	/** Write nothing live: keep Vesperia's version of each conflicted path in the store and mark the Workspace conflicted. */
-	private storeConflicts(row: WsRow, plan: Plan, why?: string): { text: string; state: WsState; code: string } {
+	/** Write nothing live: keep Vesperia's version of each conflicted path in the store, mark the Workspace conflicted, and write the marker text of each text conflict into the Workspace. */
+	private async storeConflicts(row: WsRow, plan: Plan, why?: string): Promise<{ text: string; state: WsState; code: string }> {
 		if (plan.conflicts.length === 0) { this.hold(row.id, "preflight", `${row.project}: ${why ?? "a path changed during the merge"}`); return { text: `Merge held: ${why ?? "a path changed during the merge"}`, state: "held", code: "preflight" }; }
+		const before = plan.conflicts.map((c) => (this.cas.db.prepare("SELECT theirs FROM conflicts WHERE workspace = ? AND path = ?").get(row.id, c.path) as { theirs: string | null } | undefined)?.theirs);
 		const puts = plan.conflicts.map((c) => (c.ours === null ? undefined : pack(c.ours)));
 		const theirs = plan.conflicts.map((c) => (c.theirs === null ? undefined : pack(c.theirs)));
 		this.cas.tx(() => {
 			this.cas.insert([...puts, ...theirs].filter((p): p is Packed => p !== undefined));
-			this.cas.db.prepare("DELETE FROM conflicts WHERE workspace = ?").run(row.id);
-			const stmt = this.cas.db.prepare("INSERT INTO conflicts VALUES (?, ?, ?, ?, ?)");
+			const stmt = this.cas.db.prepare("INSERT OR REPLACE INTO conflicts VALUES (?, ?, ?, ?, ?)");
 			plan.conflicts.forEach((c, i) => stmt.run(row.id, c.path, c.kind, puts[i]?.id ?? null, c.theirsHash));
 			this.hold(row.id, "conflicts", String(plan.conflicts.length), "conflicted");
 		});
-		return { text: this.conflictText(plan.conflicts), state: "conflicted", code: "conflicts" };
+		// Markers go in after the store holds her version. A block the user is editing stays while the live text is the one it was made against.
+		for (const [i, c] of plan.conflicts.entries()) {
+			if (c.text === undefined || before[i] === c.theirsHash) continue;
+			await this.fs.writeFile(c.wsPath, c.text);
+		}
+		return { text: this.conflictText(plan.conflicts, plan.lww), state: "conflicted", code: "conflicts" };
 	}
 
-	private conflictText(conflicts: { path: string; kind: string }[]): string {
-		return [`Merge refused: ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"}; nothing was written to the live folder`, ...LIMITED(conflicts.map((c) => `  ${c.kind}: ${c.path}`)), "Resolve them in the live folder or the Workspace and run /conclave merge again, or /conclave discard."].join("\n");
+	private conflictText(conflicts: { path: string; kind: string; lines?: number[] }[], lww: Plan["lww"] = []): string {
+		const at = (c: { lines?: number[] }): string => (c.lines === undefined || c.lines.length === 0 ? "" : ` (marked at line${c.lines.length === 1 ? "" : "s"} ${c.lines.join(", ")})`);
+		return [`Merge refused: ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"}; nothing was written to the live folder`, ...LIMITED(conflicts.map((c) => `  ${c.kind}: ${c.path}${at(c)}`)), ...this.lwwLines(lww), "Resolve them in the live folder or the Workspace (remove the marker blocks, or make the Workspace file equal the live one) and run /conclave merge again, or /conclave discard."].join("\n");
+	}
+
+	private lwwLines(lww: Plan["lww"]): string[] {
+		return LIMITED([...new Map(lww.map((l) => [l.path, l])).values()].map((l) => `  .lww ${l.rule}: ${l.path} kept the ${l.kept === "ours" ? "Workspace" : "live"} side`));
 	}
 
 	/** GC after each merge, undo or discard, and the store-size notice. */
@@ -877,7 +962,7 @@ export class Workspaces {
 		const plan = await this.plan(row);
 		if (plan.ignoreFailed) return fail("ignore-rules", "");
 		if (seen !== undefined && shown(plan) !== seen) return { text: "The live folder or the Workspace changed while you answered; nothing was merged. Run /conclave merge again.", state: row.state };
-		if (plan.conflicts.length > 0 && !force) return this.storeConflicts(row, plan);
+		if (plan.conflicts.length > 0 && !force) return await this.storeConflicts(row, plan);
 		if (plan.headMoved !== undefined && !confirmed.has("head-moved")) return fail("head-moved", `${plan.headMoved.from} ${plan.headMoved.to}`);
 		if (plan.deletes >= BULK_DELETE && !confirmed.has("bulk-delete")) return fail("bulk-delete", String(plan.deletes));
 		if (plan.oversize.length > 0 && !confirmed.has("oversize")) return fail("oversize", plan.oversize.map((o) => `${o.path} (her version: ${o.ws})`).join("\n"));
@@ -979,7 +1064,7 @@ export class Workspaces {
 			const over = plan.oversize.length > 0 || plan.conflicts.some((c) => c.liveSize > SNAPSHOT_MAX);
 			const finish = (out: { text: string; state: WsState }): Reply => ({ text: out.text, ended: out.state === "merged" || out.state === "discarded" });
 			if (plan.conflicts.length > 0) {
-				const stored = this.storeConflicts(row, plan);
+				const stored = await this.storeConflicts(row, plan);
 				if (plan.conflicts.some((c) => c.kind === "type" || c.kind === "case")) return { text: `${stored.text}\nForce is not offered while a type or case conflict is unresolved.`, ended: false };
 				const lines = LIMITED(plan.conflicts.map((c) => `${c.kind} ${c.path}: ${c.liveSize > SNAPSHOT_MAX ? `not merged: over 64 MiB (her version: ${c.wsPath}); copy it yourself first: the Workspace is removed after the merge` : c.ours === null ? "her deletion deletes the live file" : "her version replaces the live file"}`));
 				return { question: [...reasons, ...lines, `Replace your version of these ${plan.conflicts.length} paths with Vesperia's? (her version from before the markers; her deletions delete)`].join("\n"), no: { text: `${stored.text}\nmerge not run; nothing was changed`, ended: false }, go: async (r) => finish(await this.mergeNow(r, null, confirmed, true, shown(plan))) };
