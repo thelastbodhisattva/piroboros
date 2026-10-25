@@ -5,6 +5,8 @@ import { delimiter, posix, resolve } from "node:path";
 import { err, ExecutionError, type Result, type ShellExecResult } from "@earendil-works/pi-durable/env";
 import { ShellEnv } from "../durable.ts";
 import { checkRead, denyRoots, type GuardConfig } from "../guard.ts";
+import { type DockerConf, dockerPick, execDocker } from "./docker.ts";
+import { WsRefusal } from "./git.ts";
 import { execWsl, SelfTestError, wslDeps, wslPick, type WslConf, type WslDeps, type WslPlan } from "./wsl.ts";
 
 // Confinement for Vesperia's shell (P27e1): native bubblewrap on Linux; on Windows (P27e2) bubblewrap in WSL (./wsl.ts). `confineFor` picks the backend when a Workspace opens and
@@ -12,7 +14,9 @@ import { execWsl, SelfTestError, wslDeps, wslPick, type WslConf, type WslDeps, t
 // one argument of `bash -c` (1.4.0 cannot select its stdin transport for bash, so the stdin wrapper waits for P27e2, where wsl.exe needs it).
 
 /** The row's `confine` column. */
-export interface Confine { name: "none" | "bubblewrap"; bwrap?: string; net?: boolean; why?: string; wsl?: WslConf }
+export interface Confine { name: "none" | "bubblewrap" | "docker"; bwrap?: string; net?: boolean; why?: string; wsl?: WslConf; docker?: DockerConf }
+/** What ConfinedShellEnv gets for a shell cwd: the Workspace, its backend, and whether the backend was found unavailable (`mark` records that, and the run then ends held with code `backend`). */
+export interface Found { ws: string; confine: Confine; deps: ConfineDeps; down?: string; mark?: (reason: string) => void }
 
 /** Everything the argv and the self-test read from the machine; probes replace it. Paths are POSIX. */
 export interface ConfineDeps {
@@ -36,6 +40,7 @@ export interface ConfineDeps {
 export const UNCONFINED = "WARNING: shell commands are not confined on this system. Vesperia's commands run in the Workspace folder but can still read and write any path your account can, including your live project.";
 /** Linux refuses one argument over 131,072 bytes counting its NUL (MAX_ARG_STRLEN). */
 export const COMMAND_MAX = 131_071;
+const DOWN = "confinement backend unavailable: ";
 
 export const within = (root: string, path: string): boolean => path === root || path.startsWith(root === "/" ? "/" : `${root}/`);
 
@@ -118,8 +123,28 @@ export function bwrapArgs(d: ConfineDeps, c: { ws: string; cwd: string; net: boo
 // Runs inside the sandbox: write and remove a file in the Workspace, no auth.json beside the home, and (network on) a readable resolv.conf.
 const SELF_TEST = 'm="$1/.piroboros-selftest"; : > "$m" || { echo "the Workspace is not writable"; exit 1; }; rm -f "$m"; [ ! -e "$2/auth.json" ] || { echo "auth.json is visible"; exit 1; }; [ "$3" = 0 ] || [ -r /etc/resolv.conf ] || { echo "resolv.conf is not readable"; exit 1; }; command -v perl >/dev/null && { perl -e \'socket(S,40,1,0) and exit 1; exit($!+0==97?0:2)\' || { echo "an AF_VSOCK socket can be created"; exit 1; }; }; true';
 
-/** Pick the backend for a Workspace folder. A failure is never a run failure: it gives none plus a warning. */
-export async function confineFor(s: { confine: "auto" | "none"; network: boolean; distro?: string }, d: ConfineDeps, ws: string, plan?: WslPlan): Promise<{ confine: Confine; label: string; notice: string[]; alt?: string[] }> {
+type Picked = { confine: Confine; label: string; notice: string[]; alt?: string[] };
+
+/**
+ * Pick the backend for a Workspace folder (4.3.1): Docker first when an image is set (and always for `docker`, which refuses the run when Docker is not usable),
+ * then bubblewrap, then none. A failure under `auto` is never a run failure: it gives the next backend, or none plus a warning.
+ */
+export async function confineFor(s: { confine: "auto" | "none" | "docker"; network: boolean; distro?: string; docker?: string }, d: ConfineDeps, ws: string, plan?: WslPlan): Promise<Picked> {
+	if (s.confine === "docker" && s.docker === undefined) throw new WsRefusal('workspace.confine is "docker" but workspace.docker.image is not set');
+	let skipped = "";
+	if (s.confine !== "none" && s.docker !== undefined) {
+		try { return await dockerPick({ network: s.network, distro: s.distro, image: s.docker }, d, ws, plan ?? { places: [], alt: [], project: "", files: 0 }); } catch (error) {
+			const why = error instanceof Error ? error.message : String(error);
+			if (s.confine === "docker") throw new WsRefusal(`workspace.confine is "docker" but ${why}`);
+			skipped = why;
+		}
+	}
+	const picked = await confineLocal(s.confine === "docker" ? "auto" : s.confine, s.network, s.distro, d, ws, plan);
+	return skipped === "" ? picked : { ...picked, notice: [...picked.notice, `Docker was not used: ${skipped}.`] };
+}
+
+async function confineLocal(confine: "auto" | "none", network: boolean, distro: string | undefined, d: ConfineDeps, ws: string, plan?: WslPlan): Promise<Picked> {
+	const s = { confine, network, distro };
 	const none = (why: string, test = false): { confine: Confine; label: string; notice: string[] } =>
 		({ confine: { name: "none", why }, label: "none", notice: [test ? `WARNING: confinement failed its self-test (${why}). Shell commands are not confined: Vesperia's commands run in the Workspace folder but can still read and write any path your account can, including your live project.` : `${UNCONFINED} Not used: ${why}.`] });
 	if (s.confine === "none") return none("workspace.confine is none");
@@ -138,20 +163,29 @@ export async function confineFor(s: { confine: "auto" | "none"; network: boolean
 
 /** Wraps each command of a Workspace whose row says bubblewrap; every other command runs as before. A command a chosen backend cannot start is an error, never a rerun. */
 export class ConfinedShellEnv extends ShellEnv {
-	private readonly lookup: (cwd: string) => { ws: string; confine: Confine; deps: ConfineDeps } | undefined;
+	private readonly lookup: (cwd: string) => Found | undefined;
 
-	constructor(options: ConstructorParameters<typeof ShellEnv>[0], lookup: (cwd: string) => { ws: string; confine: Confine; deps: ConfineDeps } | undefined) { super(options); this.lookup = lookup; }
+	constructor(options: ConstructorParameters<typeof ShellEnv>[0], lookup: (cwd: string) => Found | undefined) { super(options); this.lookup = lookup; }
 
 	override async exec(command: Parameters<ShellEnv["exec"]>[0], options: Parameters<ShellEnv["exec"]>[1], context: Parameters<ShellEnv["exec"]>[2]): Promise<Result<ShellExecResult, ExecutionError>> {
 		if (typeof command !== "string") return super.exec(command, options, context);
 		const cwd = resolve(this.cwd, options?.cwd ?? ".");
 		const w = this.lookup(cwd);
-		if (w === undefined || w.confine.name !== "bubblewrap") return super.exec(command, options, context);
+		if (w === undefined || w.confine.name === "none") return super.exec(command, options, context);
+		const unavailable = (reason: string): Result<ShellExecResult, ExecutionError> => err(new ExecutionError("spawn_error", `${DOWN}${reason}`));
+		// A Docker backend found unavailable stays so for the run: nothing spawns, nothing runs unconfined (bubblewrap has no such state: its start failure is per command).
+		if (w.down !== undefined) return unavailable(w.down);
 		const bytes = Buffer.byteLength(command);
 		if (command.includes("\0") || bytes > COMMAND_MAX) return err<ShellExecResult, ExecutionError>(new ExecutionError("spawn_error", command.includes("\0") ? "this command holds a NUL byte, which a confined shell cannot take; write it to a script file in the Workspace and run that" : `this command is too long for a confined shell (${bytes} bytes, limit 128 KiB); write it to a script file in the Workspace and run that`));
-		if (w.confine.wsl !== undefined) return execWsl(w, cwd, command, options, context);
-		const { args } = bwrapArgs(w.deps, { ws: w.ws, cwd, net: w.confine.net !== false, path: options?.env?.PATH ?? "" }, ["bash", "-c", command]);
-		const result = await super.exec(seccompExec(w.confine.bwrap!, args), options, context);
-		return !result.ok && result.error.code === "spawn_error" ? err<ShellExecResult, ExecutionError>(new ExecutionError("spawn_error", `confinement backend unavailable: ${result.error.message}`, result.error)) : result;
+		let result: Result<ShellExecResult, ExecutionError>;
+		if (w.confine.docker !== undefined) result = await execDocker(w, cwd, command, options, context, (argv, o) => super.exec(argv, o, context));
+		else if (w.confine.wsl !== undefined) result = await execWsl(w, cwd, command, options, context);
+		else {
+			const { args } = bwrapArgs(w.deps, { ws: w.ws, cwd, net: w.confine.net !== false, path: options?.env?.PATH ?? "" }, ["bash", "-c", command]);
+			result = await super.exec(seccompExec(w.confine.bwrap!, args), options, context);
+			if (!result.ok && result.error.code === "spawn_error") result = unavailable(result.error.message);
+		}
+		if (w.confine.docker !== undefined && !result.ok && result.error.code === "spawn_error" && result.error.message.startsWith(DOWN)) w.mark?.(result.error.message.slice(DOWN.length));
+		return result;
 	}
 }

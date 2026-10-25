@@ -5,8 +5,9 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { checkPath, checkRead, WIDE_SECRET, type GuardConfig } from "../guard.ts";
 import { canonicalize, isInside, samePath } from "../paths.ts";
 import { ConflictFound, HoldError, realFs, Writer, type Fs, type Row } from "./apply.ts";
-import { confineFor, nativeDeps, type Confine, type ConfineDeps } from "./confine.ts";
-import { wslRemove, wslSweep, type WslConf, type WslPlan } from "./wsl.ts";
+import { confineFor, nativeDeps, type Confine, type ConfineDeps, type Found } from "./confine.ts";
+import { dockerRemove, dockerSweep, type DockerConf } from "./docker.ts";
+import { wslRemove, wslSweep, type Remote, type WslPlan } from "./wsl.ts";
 import { BATCH_BYTES, Cas, GC_GRACE, OPEN_BATCH, pack, SNAPSHOT_MAX, type Packed } from "./cas.ts";
 import { HostGit, WsRefusal, type GitSpy, type GitState } from "./git.ts";
 import { lwwMatch, lwwRules, type LwwRule } from "./lww.ts";
@@ -38,12 +39,14 @@ const sha = (data: string | Uint8Array): string => createHash("sha256").update(d
 const posix = (p: string): string => p.replaceAll("\\", "/");
 const msg = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 const code = (error: unknown): string | undefined => (error as NodeJS.ErrnoException | undefined)?.code;
+/** Whether the Workspace is used from a WSL distro (bubblewrap there, or Docker through the runner): its place folders and line endings are prepared on Windows. */
+const onWsl = (c: Confine): boolean => c.wsl !== undefined || c.docker?.remote !== undefined;
 
 export interface WsOptions {
 	/** PIROBOROS_HOME: the store is ${home}/ws/store.sqlite. */
 	home: string;
 	guard(): GuardConfig;
-	settings(): { enabled: boolean; nested: "ask" | "copy" | "inplace"; confine?: "auto" | "none"; network?: boolean; wslDistro?: string };
+	settings(): { enabled: boolean; nested: "ask" | "copy" | "inplace"; confine?: "auto" | "none" | "docker"; network?: boolean; wslDistro?: string; dockerImage?: string };
 	/** Replaces parts of what confinement reads from the machine (probes). */
 	confineDeps?: Partial<ConfineDeps>;
 	notice(text: string): void;
@@ -124,6 +127,8 @@ export class Workspaces {
 	private readonly byConv = new Map<number, WsRow>();
 	private readonly chains = new Map<string, Promise<unknown>>();
 	private readonly queued = new Set<number>();
+	/** Workspaces whose confinement backend was found unavailable in this run, with the reason: no command spawns, and the run ends held with code `backend`. */
+	private readonly down = new Map<number, string>();
 	private readonly ignored = new Map<number, string[]>();
 	private readonly chainKeys = new Map<string, string>();
 	taskStatus: WsOptions["taskStatus"];
@@ -173,7 +178,12 @@ export class Workspaces {
 		if (row?.conv != null) { if (["open", "held", "conflicted"].includes(row.state)) this.byConv.set(row.conv, row); else this.byConv.delete(row.conv); }
 	}
 
-	private hold(id: number, code: string, detail: string | null = null, state: WsState = "held"): void { this.set(id, { state, hold: code, hold_detail: detail }); }
+	/** A hold removes the Workspace's container (best effort; the startup sweep finishes it). A parked task keeps it: `reopenParked` does not reopen through `open`. */
+	private hold(id: number, code: string, detail: string | null = null, state: WsState = "held"): void {
+		this.set(id, { state, hold: code, hold_detail: detail });
+		const c = code === "parked" ? undefined : (JSON.parse(this.row(id)?.confine ?? "{}") as Confine).docker;
+		if (c !== undefined) void dockerRemove(this.confineDeps(), c).catch(() => undefined);
+	}
 
 	/** The newest merge record of a Workspace for a run key. */
 	private record(ws: number, run: string): { id: number; state: string; summary: string | null } | undefined {
@@ -276,12 +286,14 @@ export class Workspaces {
 				if (same.mode === "git" && refs.length > 0 && (await this.git.missingObjects(project, refs)).length > 0) {
 					throw new WsRefusal(`the live repository no longer has objects this Workspace's git needs (pruned since ${new Date(same.created).toISOString().slice(0, 10)}); its files are intact: /conclave merge or /conclave discard still work.`);
 				}
-				const prior = (JSON.parse(same.confine) as Confine).wsl;
+				const earlier = JSON.parse(same.confine) as Confine;
+				const prior = earlier.wsl ?? earlier.docker;
 				const alt = same.mode === "git" ? prior?.alt ?? (await this.fs.readFile(join(same.folder, ".git", "objects", "info", "alternates"), "utf8").then((t) => t.split(/\r?\n/u).filter((l) => l !== ""), () => [] as string[])) : [];
 				const places = prior?.places ?? ["node_modules"];
-				const picked = await this.pick(same.folder, { places, alt, project, files: 0, prev: prior });
-				if (picked.confine.wsl !== undefined) for (const place of places) await this.fs.mkdir(join(same.folder, place), { recursive: true } as never);
+				const picked = await this.pick(same.folder, { places, alt, project, files: 0, prev: earlier.wsl, prevDocker: earlier.docker });
+				if (onWsl(picked.confine)) for (const place of places) await this.fs.mkdir(join(same.folder, place), { recursive: true } as never);
 				if (same.mode === "git") await this.fs.writeFile(join(same.folder, ".git", "objects", "info", "alternates"), `${(picked.alt ?? alt).join("\n")}\n`);
+				this.down.delete(same.id);
 				const refreshed = await this.refreshLive(same).catch((error: unknown) => { this.o.notice(`the earlier Workspace could not be refreshed from ${project} (${msg(error)})`); return 0; });
 				this.cas.tx(() => { this.cas.db.prepare("UPDATE workspaces SET key = ?, conv = NULL, state = 'open', hold = NULL, hold_detail = NULL, confine = ? WHERE id = ?").run(key, JSON.stringify(picked.confine), same.id); });
 				if (same.conv !== null) this.byConv.delete(same.conv);
@@ -368,7 +380,7 @@ export class Workspaces {
 			for (const i of items) groups.set(i.path.toLowerCase(), [...(groups.get(i.path.toLowerCase()) ?? []), i.path]);
 			for (const [, paths] of groups) if (paths.length > 1) { skipped.push(`${paths.join(", ")} (names equal under case folding)`); for (const p of paths) items.splice(items.findIndex((i) => i.path === p), 1); }
 		}
-		let wsl: WslConf | undefined;
+		let chosen: Confine | undefined;
 		try {
 			const gitFiles = mode === "git" && state.kind === "tree" ? await this.gitAllowList(state.gitDir) : [];
 			const total = items.length + gitFiles.length;
@@ -431,12 +443,10 @@ export class Workspaces {
 			const objectIds = [...ents.values()].flatMap((e) => (e.object === null ? [] : [e.object]));
 			const places = [...new Set([...links, "node_modules"])];
 			const picked = await this.pick(folder, { places, alt, project, files: items.length });
-			wsl = picked.confine.wsl;
-			if (wsl !== undefined) {
-				for (const place of places) await ensure(join(folder, place));
-				await this.fs.writeFile(join(folder, ".git", "objects", "info", "alternates"), `${(picked.alt ?? []).join("\n")}\n`).catch(() => undefined);
-				if (mode === "git") await this.liveLineEndings(project, folder);
-			}
+			chosen = picked.confine;
+			if (onWsl(chosen)) for (const place of places) await ensure(join(folder, place));
+			if (picked.alt !== undefined) await this.fs.writeFile(join(folder, ".git", "objects", "info", "alternates"), `${picked.alt.join("\n")}\n`).catch(() => undefined);
+			if (onWsl(chosen) && mode === "git") await this.liveLineEndings(project, folder);
 			let baseId = 0;
 			this.cas.tx(() => {
 				if (this.cas.missing(objectIds).length > 0) throw new WsRefusal("the store dropped objects of this copy while it was made; approve again");
@@ -460,7 +470,7 @@ export class Workspaces {
 			];
 			return { folder, notice: out };
 		} catch (error) {
-			await this.removeFolder(folder, wsl).catch(() => undefined);
+			await this.removeFolder(folder, chosen).catch(() => undefined);
 			throw error;
 		}
 	}
@@ -661,24 +671,24 @@ export class Workspaces {
 	/** The confinement backend for a Workspace folder, chosen at each open and reopen (4.3.1). */
 	private pick(folder: string, plan: WslPlan): ReturnType<typeof confineFor> {
 		const s = this.o.settings();
-		return confineFor({ confine: s.confine ?? "auto", network: s.network ?? true, distro: s.wslDistro }, this.confineDeps(), folder, plan);
+		return confineFor({ confine: s.confine ?? "auto", network: s.network ?? true, distro: s.wslDistro, docker: s.dockerImage }, this.confineDeps(), folder, plan);
 	}
 
 	/** The open Workspace a shell cwd lies in, when its row names a backend: what ConfinedShellEnv wraps the command with. */
-	shellFor(cwd: string): { ws: string; confine: Confine; deps: ConfineDeps } | undefined {
+	shellFor(cwd: string): Found | undefined {
 		for (const row of this.byConv.values()) {
 			if (row.state !== "open") continue;
 			try {
 				const confine = JSON.parse(row.confine) as Confine;
-				if (confine.name !== "none" && isInside(canonicalize(row.folder), canonicalize(cwd))) return { ws: row.folder, confine, deps: this.confineDeps() };
+				if (confine.name !== "none" && isInside(canonicalize(row.folder), canonicalize(cwd))) return { ws: row.folder, confine, deps: this.confineDeps(), down: this.down.get(row.id), mark: (reason) => { this.down.set(row.id, reason); } };
 			} catch { /* not this row */ }
 		}
 		return undefined;
 	}
 
-	/** Whether the project's open Workspace runs its shell confined (the brief says so). */
-	confinedFor(project: string): boolean {
-		try { return (JSON.parse(this.rows("project = ? AND state = 'open'", canonicalize(project))[0]?.confine ?? "{}") as Partial<Confine>).name === "bubblewrap"; } catch { return false; }
+	/** Whether the project's open Workspace runs its shell confined, and in a container (the brief says so). */
+	confinedFor(project: string, name?: Confine["name"]): boolean {
+		try { const got = (JSON.parse(this.rows("project = ? AND state = 'open'", canonicalize(project))[0]?.confine ?? "{}") as Partial<Confine>).name; return name === undefined ? got === "bubblewrap" || got === "docker" : got === name; } catch { return false; }
 	}
 
 	/** Whether the conversation runs in a Workspace. */
@@ -996,7 +1006,8 @@ export class Workspaces {
 			}
 			if (row.state === "open" && r === undefined) {
 				if (verdict !== "done") { this.hold(row.id, "verdict", failure ?? (verdict === "unknown" ? "without a verdict" : verdict)); return out(holdText("verdict", failure ?? (verdict === "unknown" ? "without a verdict" : verdict))); }
-				if (backend !== undefined) { this.hold(row.id, "backend", backend); return out(holdText("backend", backend)); }
+				const down = backend ?? this.down.get(row.id);
+				if (down !== undefined) { this.hold(row.id, "backend", down); return out(holdText("backend", down)); }
 				const result = await this.mergeNow(row, key);
 				return { text: result.text, merge: { state: result.state, ...(result.record === undefined ? {} : { record: result.record }), ...(result.code === undefined ? {} : { code: result.code }) } };
 			}
@@ -1081,14 +1092,23 @@ export class Workspaces {
 		try { names = await this.fs.readdir(dir); } catch { return; }
 		for (const name of names) if (!keep.has(name)) await this.removeFolder(join(dir, name)).catch((error: unknown) => this.o.notice(`could not remove ${join(dir, name)}: ${msg(error)}`));
 		// The ext4 folders of each distro a Workspace of this store used: ids with no open, held or conflicted row go (only the own home-hash folder is listed).
-		const wsl = this.confineDeps().wsl;
-		const used = new Map<string, WslConf>();
-		for (const row of this.rows("1 = 1")) { const c = (JSON.parse(row.confine) as Confine).wsl; if (c !== undefined) used.set(`${c.distro}/${c.user}`, c); }
-		if (wsl !== undefined) for (const c of used.values()) await wslSweep(wsl, c, keep).catch((error: unknown) => this.o.notice(`could not sweep the sandbox folders in ${c.distro}: ${msg(error)}`));
+		const deps = this.confineDeps();
+		const used = new Map<string, Remote>();
+		const engines = new Map<string, DockerConf>();
+		for (const row of this.rows("1 = 1")) {
+			const confine = JSON.parse(row.confine) as Confine;
+			const c = confine.wsl ?? confine.docker?.remote;
+			if (c !== undefined) used.set(`${c.distro}/${c.user}`, c);
+			if (confine.docker !== undefined) engines.set(`${confine.docker.cli}/${confine.docker.remote?.distro}/${confine.docker.remote?.user}`, confine.docker);
+		}
+		if (deps.wsl !== undefined) for (const c of used.values()) await wslSweep(deps.wsl, c, keep).catch((error: unknown) => this.o.notice(`could not sweep the sandbox folders in ${c.distro}: ${msg(error)}`));
+		// Containers of this home hash with no `open` row. ponytail: an orphan is found only through an engine some row of this store used.
+		const open = new Set(this.rows("state = 'open'").map((r) => String(r.id)));
+		for (const c of engines.values()) await dockerSweep(deps, c, this.hash, open).catch((error: unknown) => this.o.notice(`could not sweep the containers: ${msg(error)}`));
 	}
 
 	/** Never rmSync recursive over a Workspace: links are removed as links, then the real folders. */
-	async removeFolder(dir: string, known?: WslConf): Promise<void> {
+	async removeFolder(dir: string, known?: Confine): Promise<void> {
 		const walk = async (d: string): Promise<void> => {
 			let list: import("node:fs").Dirent[];
 			try { list = await this.fs.readdir(d, { withFileTypes: true } as never) as unknown as import("node:fs").Dirent[]; } catch { return; }
@@ -1100,10 +1120,12 @@ export class Workspaces {
 		};
 		await walk(dir);
 		await this.fs.rm(dir, { recursive: true, force: true, maxRetries: 5 });
-		let wsl = known;
-		try { wsl ??= (JSON.parse(this.rows("folder = ?", dir)[0]?.confine ?? "{}") as Confine).wsl; } catch { /* no row */ }
-		const runner = this.confineDeps().wsl;
-		if (wsl !== undefined && runner !== undefined) await wslRemove(runner, wsl).catch((error: unknown) => this.o.notice(`the sandbox folder ${wsl.ext4} could not be removed: ${msg(error)}`));
+		let confine = known;
+		try { confine ??= JSON.parse(this.rows("folder = ?", dir)[0]?.confine ?? "{}") as Confine; } catch { /* no row */ }
+		const deps = this.confineDeps();
+		if (confine?.docker !== undefined) await dockerRemove(deps, confine.docker).catch((error: unknown) => this.o.notice(`the container ${confine.docker?.container.slice(0, 12)} could not be removed: ${msg(error)}`));
+		const remote = confine?.wsl ?? confine?.docker?.remote;
+		if (remote !== undefined && deps.wsl !== undefined) await wslRemove(deps.wsl, remote).catch((error: unknown) => this.o.notice(`the sandbox folder ${remote.ext4} could not be removed: ${msg(error)}`));
 	}
 
 	/**
@@ -1191,7 +1213,7 @@ export class Workspaces {
 		const w = this.rows("project = ?", canonicalize(project))[0];
 		if (w === undefined) return [];
 		const commits = Number((this.cas.db.prepare("SELECT COUNT(*) AS n FROM commits WHERE workspace = ? AND kind = 'checkpoint'").get(w.id) as { n: number }).n);
-		return [`Workspace ${w.id}: ${w.state}${w.hold === null ? "" : ` (${holdText(w.hold, w.hold_detail)})`}${parked ? " [task parked]" : ""}`, `  mode ${w.mode}${from === undefined ? "" : ` (${from})`}, folder ${w.folder}, ${commits} checkpoint${commits === 1 ? "" : "s"}`, (() => { const c = JSON.parse(w.confine) as Confine; return c.name === "bubblewrap" ? `  shell confinement: bubblewrap${c.wsl === undefined ? "" : ` in WSL (${c.wsl.distro})`}, network ${c.net === false ? "off" : "on"}` : `  shell confinement: none; commands are not confined${c.why === undefined ? "" : ` (${c.why})`}`; })()];
+		return [`Workspace ${w.id}: ${w.state}${w.hold === null ? "" : ` (${holdText(w.hold, w.hold_detail)})`}${parked ? " [task parked]" : ""}`, `  mode ${w.mode}${from === undefined ? "" : ` (${from})`}, folder ${w.folder}, ${commits} checkpoint${commits === 1 ? "" : "s"}`, (() => { const c = JSON.parse(w.confine) as Confine; return c.name !== "none" ? `  shell confinement: ${c.name}${c.docker === undefined ? "" : ` (${c.docker.image})`}${c.wsl === undefined && c.docker?.remote === undefined ? "" : ` in WSL (${(c.wsl ?? c.docker!.remote!).distro})`}, network ${c.net === false ? "off" : "on"}` : `  shell confinement: none; commands are not confined${c.why === undefined ? "" : ` (${c.why})`}`; })()];
 	}
 
 	/* --- undo -------------------------------------------------------------------------------------------------- */

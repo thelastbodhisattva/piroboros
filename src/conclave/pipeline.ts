@@ -732,7 +732,9 @@ export class Conclave {
 			input.workspace === "git" ? "git commits stay in the Workspace and push is disabled." : "This Workspace has no git repository: git commands here see none.",
 			"Git-ignored and secret-named paths are absent, and files you create at such paths are never merged.",
 			"node_modules starts empty. Install packages into it when you need them (for example npm ci); it is never merged.",
-			this.deps.workspaces?.confinedFor(input.cwd)
+			this.deps.workspaces?.confinedFor(input.cwd, "docker")
+				? "Your shell runs in a Docker container: it sees only the Workspace (at /work) and the image, and a write elsewhere lands in the container and is lost when it is replaced."
+				: this.deps.workspaces?.confinedFor(input.cwd)
 				? "Your shell is confined with bubblewrap: it can read most of the system, but a write outside the Workspace fails, or lands in /tmp or your hidden home folder and is discarded when the command ends (paths on PATH under your home stay visible)."
 				: "Your shell is not confined: it can reach paths outside the Workspace, but write only inside it.",
 		];

@@ -201,7 +201,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 	const notice = (message: string): void => options.onStatus?.({ kind: "notice", message });
 	const workspaces = new Workspaces({
 		home: options.home, guard: guardConfig, notice, ...options.workspace,
-		settings: () => { const w = withDefaults(settings).workspace; return { enabled: w.enabled, nested: w.nested, confine: w.confine, network: w.network, wslDistro: w.wsl?.distro }; },
+		settings: () => { const w = withDefaults(settings).workspace; return { enabled: w.enabled, nested: w.nested, confine: w.confine, network: w.network, wslDistro: w.wsl?.distro, dockerImage: w.docker?.image }; },
 	});
 	// F7: liveness comes from the pipeline task through the harness (isTaskLive). F3: the turn's origin is read from the turn state.
 	const guard = createGuard({
