@@ -41,6 +41,10 @@ export interface SearchDeps {
 	loadFff?(): Promise<Fff>;
 	/** The ripgrep program. Default `rg`. */
 	rg?: string;
+	/** True for a folder inside a Workspace: ignore files above it never describe the project, so rg skips them. */
+	inWorkspace?(cwd: string): boolean;
+	/** Test seam: called each time an index holder is built. */
+	holderBuilt?(cwd: string): void;
 }
 
 export interface SearchStatus {
@@ -120,22 +124,28 @@ export async function probeSearch(options: { rg?: string; loadFff?: () => Promis
 export function createSearch(deps: SearchDeps): Search {
 	const rg = deps.rg ?? "rg";
 	let fffPromise: Promise<Fff> | undefined;
-	let holder: Holder | undefined;
+	// Two indexes, least recently used first: the root's and Vesperia's Workspace, so alternating searches build each once.
+	let holders: Holder[] = [];
 	let creating: Promise<unknown> = Promise.resolve();
 
 	const loadFff = (): Promise<Fff> => (fffPromise ??= (deps.loadFff ?? (() => import("@ff-labs/fff-node")))());
 	const allowed = (path: string, cwd: string): boolean => checkPath(path, cwd, deps.guard()).allowed;
+	// Ignore files above a Workspace (and the global one) never describe the project, whose own rules already decided what was copied.
+	const wsFlags = (cwd: string): string[] => (deps.inWorkspace?.(cwd) ? ["--no-ignore-parent", "--no-ignore-global"] : []);
 
+	const drop = (h: Holder): void => { if (!h.finder.isDestroyed) h.finder.destroy(); };
 	const destroy = (): void => {
-		if (holder !== undefined && !holder.finder.isDestroyed) holder.finder.destroy();
-		holder = undefined;
+		for (const h of holders) drop(h);
+		holders = [];
 	};
 
-	/** One index per working directory; a different directory replaces it. Creation is serialized. */
+	/** One index per working directory, at most two; the least recently used goes when a third is needed. Creation is serialized. */
 	const finderFor = (cwd: string): Promise<Holder> => {
 		const next = creating.then(async () => {
-			if (holder !== undefined && holder.cwd === cwd && !holder.finder.isDestroyed) return holder;
-			destroy();
+			const hit = holders.find((h) => h.cwd === cwd && !h.finder.isDestroyed);
+			if (hit !== undefined) { holders = [...holders.filter((h) => h !== hit), hit]; return hit; }
+			holders = holders.filter((h) => !h.finder.isDestroyed);
+			while (holders.length >= 2) drop(holders.shift()!);
 			const fff = await loadFff();
 			const base = { basePath: cwd, aiMode: true, enableHomeDirScanning: false, enableFsRootScanning: false };
 			mkdirSync(join(deps.home, "fff"), { recursive: true });
@@ -148,7 +158,10 @@ export function createSearch(deps: SearchDeps): Search {
 				made.value.destroy();
 				throw new Error(waited.error);
 			}
-			return (holder = { cwd, finder: made.value, cursors: new Map() });
+			deps.holderBuilt?.(cwd);
+			const built = { cwd, finder: made.value, cursors: new Map<string, GrepCursor[]>() };
+			holders.push(built);
+			return built;
 		});
 		creating = next.catch(() => undefined);
 		return next;
@@ -186,7 +199,7 @@ export function createSearch(deps: SearchDeps): Search {
 	}
 
 	async function findRg(cwd: string, query: string, constraint: string | undefined, page: number, reason: string): Promise<Reply> {
-		const argv = ["--no-config", "--no-messages", "--no-require-git", "--files", "--sort", "path", "--glob", "!.git", ...(constraint === undefined ? [] : ["--glob", rgGlob(constraint)]), "--", "."];
+		const argv = ["--no-config", "--no-messages", "--no-require-git", ...wsFlags(cwd), "--files", "--sort", "path", "--glob", "!.git", ...(constraint === undefined ? [] : ["--glob", rgGlob(constraint)]), "--", "."];
 		const words = query.toLowerCase().split(/\s+/u).filter((word) => word !== "");
 		const hits: string[] = [];
 		let run: { code: number | null; stderr: string };
@@ -257,7 +270,7 @@ export function createSearch(deps: SearchDeps): Search {
 
 	async function grepRg(cwd: string, a: GrepArgs, reason: string): Promise<Reply> {
 		const argv = [
-			"--no-config", "--no-messages", "--no-require-git", "--json", "--smart-case", "--max-count", "200", "--max-filesize", "1M", "--glob", "!.git",
+			"--no-config", "--no-messages", "--no-require-git", ...wsFlags(cwd), "--json", "--smart-case", "--max-count", "200", "--max-filesize", "1M", "--glob", "!.git",
 			...(a.constraint === undefined ? [] : ["--glob", rgGlob(a.constraint)]),
 			...(a.context > 0 ? ["-C", String(a.context)] : []),
 			...(a.mode === "regex" ? [] : ["--fixed-strings"]),
@@ -372,7 +385,7 @@ export function createSearch(deps: SearchDeps): Search {
 	return {
 		tools: [findTool, grepTool] as ToolRegistration[],
 		close: destroy,
-		indexCwd: () => holder?.cwd,
+		indexCwd: () => holders[holders.length - 1]?.cwd,
 		status: () => probeSearch({ rg, loadFff: deps.loadFff }),
 	};
 }

@@ -16,7 +16,7 @@ export const COMMANDS: readonly CommandInfo[] = [
 	{ name: "login", description: "sign in to a provider", args: "[provider]" },
 	{ name: "settings", description: "show or change a setting", args: "[key]" },
 	{ name: "status", description: "show the chat and compactor status" },
-	{ name: "conclave", description: "run the review pipeline on a task", args: "<task> | approve | cancel | status | undo" },
+	{ name: "conclave", description: "run the review pipeline on a task", args: "<task> | approve | cancel | status | undo | merge | discard | retry" },
 	{ name: "akashic", description: "memory status, accept and vault", args: "[status | accept | vault ...]" },
 	{ name: "thinking-steps", description: "choose how thinking steps are shown", args: "[mode | global <mode | clear>]" },
 	{ name: "skills", description: "list the skills the chat can use" },
@@ -135,7 +135,7 @@ export function suggest(value: string, models: readonly ModelOption[] = [], logi
 		const needle = arg.toLowerCase();
 		return models.filter((model) => model.ref.toLowerCase().includes(needle)).map((model) => ({ complete: `/model ${model.ref}`, label: model.ref, ...(model.disabled === undefined ? {} : { disabled: model.disabled }) }));
 	}
-	if (name === "conclave") return tokens.length > 1 ? [] : words(lead, last, ["approve", "cancel", "status", "undo"]);
+	if (name === "conclave") return tokens.length > 1 ? [] : words(lead, last, ["approve", "cancel", "status", "undo", "merge", "discard", "retry"]);
 	if (name === "thinking-steps") {
 		if (tokens.length === 1) return words(lead, last, [...MODES, "global"], ["global"]);
 		return tokens.length === 2 && tokens[0] === "global" ? words(lead, last, [...MODES, "clear"]) : [];

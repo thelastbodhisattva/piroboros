@@ -436,7 +436,10 @@ export function missingKeyCheck(authPath: string, env: NodeJS.ProcessEnv = proce
 
 /** /conclave undo: list what it would do, ask, then restore the pre-images of the last Vesperia run. */
 async function undoCommand(rt: Runtime, ask: (question: string) => Promise<boolean>): Promise<string> {
-	if (await rt.conclave.live()) return "undo not run: a pipeline is running; /conclave cancel stops it";
+	const blocked = await rt.conclave.undoBlocked();
+	if (blocked !== undefined) return blocked;
+	const workspace = await rt.conclave.undoWorkspace(ask);
+	if (workspace !== undefined) return workspace;
 	const home = rt.guard.config().home;
 	const folder = loadRun(home);
 	if (folder === undefined) return "nothing to undo";
@@ -502,7 +505,10 @@ export function runCommand(rt: Runtime, text: string, ask?: (question: string) =
 		if (sub === "cancel") return rt.conclave.cancel();
 		if (sub === "status") return rt.conclave.status();
 		if (sub === "undo") return ask === undefined ? "undo not run: this needs a confirmation, which only the chat screen can ask" : undoCommand(rt, ask);
-		const started = sub === "approve" ? rt.conclave.approve() : rt.conclave.start(text.slice("/conclave".length));
+		if (sub === "merge") return rt.conclave.merge(ask);
+		if (sub === "discard") return rt.conclave.discard(ask);
+		if (sub === "retry") return rt.conclave.retry();
+		const started = sub === "approve" ? rt.conclave.approve(ask) : rt.conclave.start(text.slice("/conclave".length));
 		return started.then((result) => (result.ok ? result.message : `not started: ${result.error}`));
 	}
 	if (name === "telemetry") return rt.telemetry();

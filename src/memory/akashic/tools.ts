@@ -14,7 +14,8 @@ export const ACTIONS = ["remember", "record", "search", "update", "forget", "rec
 const SCOPES = ["global", "project", "all"] as const;
 
 /** Who is calling and in what kind of turn. `reportOnly` is true while the root turn holds only Conclave reports (F3). */
-export type WriterCaller = (api: ToolExecutionApi) => Promise<{ role: string; cwd: string; reportOnly: boolean }>;
+/** `project` maps an explicit project argument that lies inside a Workspace folder to the live project it copies. */
+export type WriterCaller = (api: ToolExecutionApi) => Promise<{ role: string; cwd: string; reportOnly: boolean; project?: (path: string) => string }>;
 
 export const AkashicParams = Type.Object({
 	action: StringEnum(ACTIONS),
@@ -102,13 +103,14 @@ export function createAkashicTool(host: MemoryHost, caller: WriterCaller): ToolR
 			try {
 				const who = await caller(api);
 				const actor = `piroboros:${who.role}`;
+					const given = args.project === undefined ? undefined : who.project?.(args.project) ?? args.project;
 				const stamp = [{ actor, at: Date.now() }];
 				switch (args.action) {
 					case "remember":
 					case "record": {
 						if (!args.content) throw new Error("content is required");
 						const scope = scopeForMemory(args.scope);
-						const input = { kind: args.kind ?? MemoryKind.ProjectState, content: args.content, scope, ...(scope === "project" ? { project: args.project ?? who.cwd } : {}), ...(args.tags === undefined ? {} : { tags: args.tags }), ...(args.importance === undefined ? {} : { importance: args.importance }), provenance: stamp };
+						const input = { kind: args.kind ?? MemoryKind.ProjectState, content: args.content, scope, ...(scope === "project" ? { project: given ?? who.cwd } : {}), ...(args.tags === undefined ? {} : { tags: args.tags }), ...(args.importance === undefined ? {} : { importance: args.importance }), provenance: stamp };
 						const { result, vault } = await rememberHeld(host, input, actor, who.reportOnly, "written in a turn that held only member reports");
 						const first = result.memories[0]!;
 						const held = who.reportOnly && first.state === "QUARANTINED";
@@ -121,14 +123,14 @@ export function createAkashicTool(host: MemoryHost, caller: WriterCaller): ToolR
 					}
 					case "search": {
 						if (!args.query) throw new Error("query is required");
-						const found = visible(store.search({ query: args.query, scope: args.scope ?? "all", project: args.project ?? who.cwd, limit: args.limit ?? 10 }));
+						const found = visible(store.search({ query: args.query, scope: args.scope ?? "all", project: given ?? who.cwd, limit: args.limit ?? 10 }));
 						const note = found.withheld === 0 ? "" : `\n${found.withheld} result(s) withheld by the safety scanner.`;
 						return ok(found.shown.length > 0 ? `${found.shown.map(line).join("\n")}${note}` : `No matching memories.${note}`, { action: "search", results: found.shown });
 					}
 					case "update": {
 						if (!args.id) throw new Error("id is required");
 						const old = store.getMemory(args.id);
-						const patch = { content: args.content, kind: args.kind, scope: args.scope === "all" ? undefined : args.scope, project: args.project, tags: args.tags, importance: args.importance, provenance: [...(old?.provenance ?? []), ...stamp] };
+						const patch = { content: args.content, kind: args.kind, scope: args.scope === "all" ? undefined : args.scope, project: given, tags: args.tags, importance: args.importance, provenance: [...(old?.provenance ?? []), ...stamp] };
 						const { result: memory, vault } = await host.vault.write(() => store.transaction(() => {
 							const updated = store.updateMemory(args.id!, patch);
 							// F3: an edit made while the turn held only reports takes the record out of the snapshot until the user accepts it.
@@ -149,14 +151,14 @@ export function createAkashicTool(host: MemoryHost, caller: WriterCaller): ToolR
 						return ok(`${forgotten ? "Forgotten" : "Not found"}: ${args.id}${vaultNote(vault)}`, { action: "forget", id: args.id, forgotten, ...(vault === undefined ? {} : { vault }) });
 					}
 					case "recent": {
-						const found = visible(store.recent({ scope: args.scope ?? "all", project: args.project ?? who.cwd, limit: args.limit ?? 10 }));
+						const found = visible(store.recent({ scope: args.scope ?? "all", project: given ?? who.cwd, limit: args.limit ?? 10 }));
 						const note = found.withheld === 0 ? "" : `\n${found.withheld} result(s) withheld by the safety scanner.`;
 						return ok(found.shown.length > 0 ? `${found.shown.map(line).join("\n")}${note}` : `No recent memories.${note}`, { action: "recent", results: found.shown });
 					}
 					case "group": {
 						if (!args.groupId) throw new Error("groupId is required");
 						// The group id ignores scope. Read one copy: the requested scope, else this project's, else the global one.
-						const project = args.project ?? who.cwd;
+						const project = given ?? who.cwd;
 						const group = args.scope === "global" ? store.getMemoryGroup(args.groupId, "global")
 							: args.scope === "project" ? store.getMemoryGroup(args.groupId, "project", project)
 							: store.getMemoryGroup(args.groupId, "project", project) ?? store.getMemoryGroup(args.groupId, "global");

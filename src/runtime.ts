@@ -14,6 +14,9 @@ import { createMnemosiaTools } from "./memory/mnemosia/tools.ts";
 import type { VaultChildRunner } from "./memory/akashic/vault.ts";
 import { checkAllowEntries, checkRead, conversationsWithoutGuardFirst, createGuard, type Guard, type GuardConfig, type PipelineState } from "./guard.ts";
 import { createSearch, type Search, type SearchDeps } from "./search.ts";
+import { Workspaces, type WsOptions } from "./ws/workspace.ts";
+import { isInside, canonicalize } from "./paths.ts";
+import { join } from "node:path";
 import { createSkills, type Skills } from "./skills.ts";
 import { contextCheck, createAppModels, resolveModel, type CustomProviders, type Models, type Provider } from "./models.ts";
 import { CompactLoop } from "./chat/compactloop.ts";
@@ -57,7 +60,9 @@ export interface RuntimeOptions {
 	onRestore?: (text: string, ids: string[]) => void;
 	env?: NodeJS.ProcessEnv;
 	/** Test seams for find and grep: the fff loader and the rg program. */
-	search?: Pick<SearchDeps, "loadFff" | "rg">;
+	search?: Pick<SearchDeps, "loadFff" | "rg" | "holderBuilt">;
+	/** Test seams for Workspaces: where they live, the fs dependency, the clock, waits and a spy on git calls. */
+	workspace?: Pick<WsOptions, "wsRoot" | "fs" | "now" | "platform" | "sleep" | "gitSpy">;
 	/** Test seams for the Conclave: the definitions to load and a hook that runs at the start of each phase. */
 	conclave?: Pick<ConclaveDeps, "definitions" | "beforePhase">;
 	/** Test seams for the learning loop: a hook at the start of each phase and the request timeout. */
@@ -85,6 +90,8 @@ export interface Runtime {
 	/** /learn: the learning loop's passes, proposals and ledger. */
 	learner: Learner;
 	guard: Guard;
+	/** Vesperia's Workspaces and their store. */
+	workspaces: Workspaces;
 	/** /conclave: start, approve, cancel, status. */
 	conclave: Conclave;
 	/** find and grep; the fff index is destroyed by close(). */
@@ -189,15 +196,21 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 		const d = withDefaults(settings);
 		return { home: options.home, profile: options.profile ?? profileDir(), deny: d.guardDeny, allow: d.guardAllow, warn: (message) => { if (!allowWarned.has(message)) { allowWarned.add(message); options.onStatus?.({ kind: "notice", message }); } }, shellTimeoutMs: d.shellTimeoutMs, shellEnvAllow: d.shellEnvAllow };
 	};
+	const notice = (message: string): void => options.onStatus?.({ kind: "notice", message });
+	const workspaces = new Workspaces({
+		home: options.home, guard: guardConfig, notice, ...options.workspace,
+		settings: () => { const w = withDefaults(settings).workspace; return { enabled: w.enabled, nested: w.nested }; },
+	});
 	// F7: liveness comes from the pipeline task through the harness (isTaskLive). F3: the turn's origin is read from the turn state.
 	const guard = createGuard({
 		config: guardConfig,
+		workspace: { has: (c) => workspaces.has(c), after: (c, t, p, cwd) => workspaces.after(c, t, p, cwd), ceiling: (cwd) => workspaces.ceilingFor(cwd) },
 		pipeline: options.pipeline ?? (() => conclave.pipelineState()),
 		reportOnly: async () => (await harness.snapshot(TurnStateDoc, ctx))?.reportOnly === true,
 		warn: (message) => options.onStatus?.({ kind: "notice", message }),
 	});
 	checkAllowEntries(guardConfig());
-	const search = createSearch({ home: options.home, guard: guardConfig, ...(options.search ?? {}) });
+	const search = createSearch({ home: options.home, guard: guardConfig, inWorkspace: (cwd) => { try { return isInside(join(workspaces.wsRoot, workspaces.hash), canonicalize(cwd)); } catch { return false; } }, ...(options.search ?? {}) });
 	const base: Extension = createBase([...guard.tools(), ...search.tools]);
 	// Skills are scanned once here and again on /reload. A skill file is opened only if the guard would let the read tool open it.
 	// Under node --test without an explicit profile the real profile is never scanned (tests must not read the user's own skills).
@@ -212,7 +225,9 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 		const role = Object.entries(members).find(([, id]) => id === conversation)?.[0] ?? "root";
 		// Vesperia's records wait for /akashic accept, like writes made in a report-only turn.
 		const reportOnly = role === "vesperia" || (conversation === (ROOT as number) && (await api.snapshot(TurnStateDoc, ctx))?.reportOnly === true);
-		return { role, cwd: (await api.agent(ctx)).cwd ?? cwd, reportOnly };
+		// A cwd (or explicit project) inside a Workspace folder is the live project it copies.
+		const there = (await api.agent(ctx)).cwd ?? cwd;
+		return { role, cwd: workspaces.projectOf(there) ?? there, reportOnly, project: (path: string) => workspaces.projectOf(path) ?? path };
 	};
 	const mnemosia = createMnemosiaTools(memory.foundations, caller);
 	// Tools only, no hooks and no sections, so where it sits changes the order of the tool list and nothing else.
@@ -260,6 +275,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 		webKey,
 		onNotice: (message) => options.onStatus?.({ kind: "notice", message }),
 		onVesperia: (run) => { ensureRun(options.home, run); },
+		workspaces,
 	});
 	// The compactor and conclave extensions carry only their tasks, which any conversation's tasks resolve by name.
 	for (const extension of [guard.extension, base, viewtools, planning, memoryExtension, webExtension, stuck, chat, skills.extension, budget, compactor.extension, learner.extension, conclave.extension]) registry.install(extension);
@@ -271,6 +287,8 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 	const planningOn = withDefaults(settings).planning;
 	const rootExtensions = [guard.extension, base, viewtools, ...(planningOn ? [planning] : []), memoryExtension, stuck, chat, skills.extension, budget];
 
+	// Merge records a crash left are rolled back or finished before the scheduler can replay any run (the home lock is held).
+	for (const line of await workspaces.recover().catch((error: unknown) => [`workspace recovery: ${reportMessage(error)}`])) notice(line);
 	// A failure to open the store turns telemetry off, visibly; the run goes on without it.
 	let telemetry: Telemetry | undefined;
 	if (withDefaults(settings).telemetry) {
@@ -339,6 +357,9 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 	// pi-durable resumes a live pipeline by itself. Say so, and forget one that ended while piroboros was closed.
 	await conclave.recover().catch((error: unknown) => report(reportMessage(error)));
 	const parked = await parkedTasks(harness);
+	// Workspace state rules: an `open` Workspace of an ended or parked task is held, and a parked task of a finished Workspace is ended.
+	const wsStart = await workspaces.startup(parked.filter((t) => t.kind === "piroboros.conclave").map((t) => String(t.id))).catch((error: unknown) => { report(reportMessage(error)); return { abort: [] as string[] }; });
+	for (const id of wsStart.abort) await harness.abortTask((/^\d+$/u.test(id) ? Number(id) : id) as never, ctx).catch(() => undefined);
 	if (parked.length > 0) options.onStatus?.({ kind: "notice", message: pausedText(parked.length) });
 
 	const compact = new CompactLoop({ harness, root, compactor, onAlarm: (text) => report(`alarm: ${text}`), onReport: (error) => report(reportMessage(error)) });
@@ -376,6 +397,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 		compactor,
 		learner,
 		guard,
+		workspaces,
 		conclave,
 		search,
 		skills,
@@ -447,6 +469,7 @@ export async function openRuntime(options: RuntimeOptions): Promise<Runtime> {
 			await step(() => learnLoop.stop());
 			await step(() => search.close());
 			await step(() => harness.close(ctx));
+			await step(() => workspaces.close());
 			await step(() => telemetry?.close());
 			// Flush the briefing traces, then close the store. The tools can no longer run.
 			await step(() => mnemosia.close());

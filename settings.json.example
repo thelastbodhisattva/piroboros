@@ -23,6 +23,7 @@
   "shellEnvAllow": [],
   "shellTimeoutMs": 600000,
   "guard": { "deny": [], "allow": [] },
+  "workspace": { "enabled": true, "nested": "ask" },
   "planning": true,
   "telemetry": true,
   "web": { "enabled": false, "maxFetches": 10, "maxSearches": 5, "search": { "provider": "tinyfish" }, "allowHosts": [], "queryHosts": [] },

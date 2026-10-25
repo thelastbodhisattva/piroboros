@@ -75,7 +75,7 @@ flowchart TD
   exec -.->|"/conclave undo"| undo["Restore the files she changed with write and edit"]
 ```
 
-The reports are held while the pipeline runs and reach the chat together when the review waits for approval or the execution ends. `/conclave cancel` stops a run, `/conclave status` shows the current member and `zoom("Name")` shows a member's whole chat.
+The reports are held while the pipeline runs and reach the chat together when the review waits for approval or the execution ends. `/conclave cancel` stops a run, `/conclave status` shows the current member and `zoom("Name")` shows a member's whole chat. Vesperia works in a Workspace copy of your project, and her changes are merged back when her run ends `done`; `/conclave merge`, `/conclave discard` and `/conclave retry` handle a held Workspace (see docs/conclave.md).
 
 Who can do what:
 

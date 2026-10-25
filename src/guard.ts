@@ -57,9 +57,20 @@ export interface PipelineState {
 	vesperia?: number;
 }
 
+/** What the guard asks of the Workspaces of Vesperia's runs (P27d1). Without one, every run is in place. */
+export interface GuardWorkspace {
+	/** Whether this conversation runs in a Workspace. */
+	has(conversationId: number): boolean;
+	/** After a write, edit or bash call of a Workspace conversation: checkpoint the path, or scan. Never throws. */
+	after(conversationId: number, tool: string, path: unknown, cwd: string | undefined): Promise<void>;
+	/** GIT_CEILING_DIRECTORIES for a shell whose cwd is in a plain Workspace. */
+	ceiling(cwd: string): string | undefined;
+}
+
 export interface GuardDeps {
 	/** Read on every check, so /reload can replace the configuration. */
 	config(): GuardConfig;
+	workspace?: GuardWorkspace;
 	/** Reads the recorded pipeline; undefined means none. A throw is treated as a live pipeline. */
 	pipeline?(): Promise<PipelineState | undefined>;
 	/** True while the root's turn was started by Conclave reports alone (F3). A throw blocks, like any unreadable state. */
@@ -362,6 +373,9 @@ export function createGuard(deps: GuardDeps): Guard {
 	const shellPrepare: BashPrepare = (execution) => {
 		execution.inheritEnv = false;
 		execution.env = shellEnv(deps.config());
+		// A plain Workspace has no repository: git must not find the one above it.
+		const ceiling = deps.workspace?.ceiling(execution.cwd);
+		if (ceiling !== undefined) execution.env.GIT_CEILING_DIRECTORIES = ceiling;
 	};
 
 	const beforeTool = async (call: { name: string; id?: string; arguments: unknown }, api: HookApi) => {
@@ -392,8 +406,9 @@ export function createGuard(deps: GuardDeps): Guard {
 			const refusal = readFirst(id, args.path, cwd);
 			if (refusal !== undefined) return { block: `blocked by guard: ${refusal}` };
 		}
-		// Every block check has passed. A Vesperia write or edit saves the pre-image first; a storage error never stops the call.
-		if (WRITE_TOOLS.has(call.name) && cwd !== undefined && (await isVesperia(id))) {
+		// Every block check has passed. In place, a Vesperia write or edit saves the pre-image first (a Workspace run has the CAS instead); a storage error never stops the call.
+		const inPlace = !deps.workspace?.has(id);
+		if (WRITE_TOOLS.has(call.name) && cwd !== undefined && inPlace && (await isVesperia(id))) {
 			const key = keyOf(args.path, cwd);
 			const path = canonicalize(String(args.path), cwd);
 			try { capture(config.home, id, key, path, cwd); } catch (error) {
@@ -402,7 +417,7 @@ export function createGuard(deps: GuardDeps): Guard {
 			}
 		}
 		// countBash failing stays silent: a missing count only understates the bash calls in the undo preview.
-		if (SHELL_TOOLS.has(call.name) && (await isVesperia(id))) {
+		if (SHELL_TOOLS.has(call.name) && inPlace && (await isVesperia(id))) {
 			try { countBash(config.home, id); } catch { /* fail open */ }
 		}
 		if (call.name === "read" && call.id !== undefined) {
@@ -420,6 +435,13 @@ export function createGuard(deps: GuardDeps): Guard {
 	const afterTool = async (call: { name: string; id?: string; arguments: unknown }, result: { isError?: boolean }, api: HookApi) => {
 		const entry = call.id === undefined ? undefined : pending.get(call.id);
 		if (call.id !== undefined) pending.delete(call.id);
+		// A failing bash command may have written files, so the Workspace checkpoint runs before the error return.
+		const id = api.conversationId as number;
+		if (deps.workspace?.has(id) && (WRITE_TOOLS.has(call.name) || SHELL_TOOLS.has(call.name))) {
+			let cwd: string | undefined;
+			try { cwd = (await api.snapshot(AgentDoc, api.conversationId, ctx))?.cwd; } catch { cwd = undefined; }
+			await deps.workspace.after(id, call.name, ((call.arguments ?? {}) as Record<string, unknown>).path, cwd);
+		}
 		if (result.isError) return undefined;
 		if (entry !== undefined) remember(entry.id, entry.key, entry.hash);
 		if (WRITE_TOOLS.has(call.name)) {
@@ -429,7 +451,7 @@ export function createGuard(deps: GuardDeps): Guard {
 			const hash = hashIfFile(canonicalize(String(args.path), cwd));
 			if (hash !== undefined) {
 				remember(api.conversationId as number, keyOf(args.path, cwd), hash);
-				if (await isVesperia(api.conversationId as number)) try { recordPost(deps.config().home, api.conversationId as number, keyOf(args.path, cwd), hash); } catch { deps.warn?.("undo: could not record the final state of a written file; /conclave undo may skip it"); }
+				if (!deps.workspace?.has(id) && (await isVesperia(id))) try { recordPost(deps.config().home, api.conversationId as number, keyOf(args.path, cwd), hash); } catch { deps.warn?.("undo: could not record the final state of a written file; /conclave undo may skip it"); }
 			}
 		}
 		return undefined;
