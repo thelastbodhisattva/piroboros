@@ -2,11 +2,11 @@
 
 A Windows-first terminal agent harness built around one long-lived chat. Each turn sends a fresh request made from a size-limited view of the chat. A background compactor keeps that view small. A panel of review agents (the Conclave) runs one member at a time, each in its own child conversation.
 
-> Status: early development. The setup wizard, the chat UI, `--print`, `--backup` and the guarded file and shell tools work. The compactor works (`/status` shows its work, its retries and whether it paused after errors). The Conclave pipeline works from the command line of the chat (`/conclave`) and has a side pane. The memory tools, the `/akashic` commands, the thinking panel and `SKILL.md` skills for the main chat work.
+> Status: early development. The setup wizard, the chat UI, `--print`, `--backup` and the guarded file and shell tools work. The compactor works (`/status` shows its work, its retries and whether it paused after errors). The Conclave pipeline works from the command line of the chat (`/conclave`) and has a side pane. Vesperia's Workspaces and shell confinement work. The memory tools, the `/akashic` commands, the thinking panel and `SKILL.md` skills for the main chat work.
 
 ## Safety
 
-piroboros runs the shell commands the model asks for, with the rights of your account. The guard is a tripwire, not a sandbox: it stops common mistakes, and a command can be worded around it. For untrusted tasks, use a throwaway directory or account. Web access is off by default. Undo copies can hold file contents unredacted.
+piroboros runs the shell commands the model asks for, with the rights of your account. The guard is a tripwire, not a sandbox: it stops common mistakes, and a command can be worded around it. Vesperia works in a Workspace copy of your project, and her shell commands run confined (bubblewrap on Linux or in WSL 2, or Docker) when a backend passes its self-test; the root chat's commands are never confined. For untrusted tasks, use a throwaway directory or account. Web access is off by default. Undo copies can hold file contents unredacted.
 
 More in [Privacy and limits](docs/privacy.md).
 
@@ -34,7 +34,8 @@ A checkout runs the TypeScript sources directly. To type `piroboros` in any term
 ## Requirements
 
 - Node.js 26.5 or newer (a checkout runs the sources through Node's type stripping; the installed package runs compiled JavaScript).
-- `bash` runs every shell command the model issues. On Windows install Git for Windows, which includes Git Bash; the WSL launcher is not used. Linux and macOS use their own bash.
+- `bash` runs every shell command the model issues. On Windows install Git for Windows, which includes Git Bash; the WSL `bash.exe` launcher is not used. Linux and macOS use their own bash.
+- Optional, to confine Vesperia's shell: `bubblewrap` on Linux, WSL 2 with `bubblewrap` on Windows, or a Docker Engine with an image you pulled. See [Shell confinement](docs/tools.md#shell-confinement).
 - `git` for the optional memory vault, and `rg` (ripgrep) for exact search and as the fallback when fff cannot load.
 - Windows and Linux are both targets.
 
@@ -72,7 +73,7 @@ flowchart TD
   exec --> verdict{"Vesperia's verdict"}
   verdict -->|"done"| fin["Finished. A new task needs a new review"]
   verdict -->|"partial, blocked or failed"| again["/conclave approve runs a new Vesperia with the earlier report"]
-  exec -.->|"/conclave undo"| undo["Restore the files she changed with write and edit"]
+  exec -.->|"/conclave undo"| undo["Restore your files from the snapshot taken before the merge"]
 ```
 
 The reports are held while the pipeline runs and reach the chat together when the review waits for approval or the execution ends. `/conclave cancel` stops a run, `/conclave status` shows the current member and `zoom("Name")` shows a member's whole chat. Vesperia works in a Workspace copy of your project, and her changes are merged back when her run ends `done`; `/conclave merge`, `/conclave discard` and `/conclave retry` handle a held Workspace (see docs/conclave.md).
@@ -83,7 +84,7 @@ Who can do what:
 | --- | --- | --- | --- | --- | --- |
 | Root chat | yes | yes, not while a pipeline runs | yes, not while a pipeline runs | all three tools | no |
 | Samaela and the reviewers | yes, plus `zoom` and `date` | no | no | `mnemosia_brief` only | Vaelia only, when `web.enabled` is on |
-| Vesperia | yes | inside the working directory | yes | all three tools, records wait for `/akashic accept` | no |
+| Vesperia | yes | in her Workspace, merged back when she ends `done` | yes, confined when a backend passes its self-test | all three tools, records wait for `/akashic accept` | no |
 
 Details: [The Conclave](docs/conclave.md).
 
@@ -117,6 +118,7 @@ A compactor on a third-party provider needs your consent (`compactor.allowThirdP
 | `/learn` | Learning loop: status, proposals, accept, reject, undo |
 | `/telemetry` | Model requests, latency and cost of the last 24 hours |
 | `/conclave <task>`, `approve`, `cancel`, `status`, `undo` | Run and control the Conclave |
+| `/conclave merge`, `discard`, `retry` | Merge, drop or retry a held Workspace |
 | `/akashic` | Memory and vault commands |
 | `/thinking-steps`, `/skills`, `/<skill-name>` | Thinking panel mode, skill list, run a skill |
 | `/` as the first character | Opens the command list |
@@ -127,11 +129,11 @@ A compactor on a third-party provider needs your consent (`compactor.allowThirdP
 ## Documentation
 
 - [Configuration and commands](docs/configuration.md): `PIROBOROS_HOME`, `instructions.md`, `models.json`, command-line flags and exit codes, `/login`, `/settings`, `/reload`, `/status`
-- [The Conclave](docs/conclave.md): the pipeline, the pane, approve, cancel, undo, retries, member models and limits
+- [The Conclave](docs/conclave.md): the pipeline, the pane, approve, cancel, undo, retries, Workspaces, member models and limits
 - [Interface](docs/interface.md): the command list, the screen layout, the look, thinking steps and keys
 - [Memory](docs/memory.md): `akashic_memory`, `mnemosia_brief`, quarantine and the Git vault
 - [Web access](docs/web.md): `web_fetch` and `web_search` for Vaelia, URL rules, limits and providers
-- [Tools and skills](docs/tools.md): file search, the plan tool, loop limits and `SKILL.md` skills
+- [Tools and skills](docs/tools.md): file search, the plan tool, loop limits, shell confinement and `SKILL.md` skills
 - [Privacy and limits](docs/privacy.md): what each provider receives, scrubbing, traces and shell limits
 - [Development](docs/development.md): typecheck, build and compactor prompt tuning
 
