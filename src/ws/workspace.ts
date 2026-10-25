@@ -6,6 +6,7 @@ import { checkPath, checkRead, WIDE_SECRET, type GuardConfig } from "../guard.ts
 import { canonicalize, isInside, samePath } from "../paths.ts";
 import { ConflictFound, HoldError, realFs, Writer, type Fs, type Row } from "./apply.ts";
 import { confineFor, nativeDeps, type Confine, type ConfineDeps } from "./confine.ts";
+import { wslRemove, wslSweep, type WslConf, type WslPlan } from "./wsl.ts";
 import { BATCH_BYTES, Cas, GC_GRACE, OPEN_BATCH, pack, SNAPSHOT_MAX, type Packed } from "./cas.ts";
 import { HostGit, WsRefusal, type GitSpy, type GitState } from "./git.ts";
 import { lwwMatch, lwwRules, type LwwRule } from "./lww.ts";
@@ -42,7 +43,7 @@ export interface WsOptions {
 	/** PIROBOROS_HOME: the store is ${home}/ws/store.sqlite. */
 	home: string;
 	guard(): GuardConfig;
-	settings(): { enabled: boolean; nested: "ask" | "copy" | "inplace"; confine?: "auto" | "none"; network?: boolean };
+	settings(): { enabled: boolean; nested: "ask" | "copy" | "inplace"; confine?: "auto" | "none"; network?: boolean; wslDistro?: string };
 	/** Replaces parts of what confinement reads from the machine (probes). */
 	confineDeps?: Partial<ConfineDeps>;
 	notice(text: string): void;
@@ -275,7 +276,12 @@ export class Workspaces {
 				if (same.mode === "git" && refs.length > 0 && (await this.git.missingObjects(project, refs)).length > 0) {
 					throw new WsRefusal(`the live repository no longer has objects this Workspace's git needs (pruned since ${new Date(same.created).toISOString().slice(0, 10)}); its files are intact: /conclave merge or /conclave discard still work.`);
 				}
-				const picked = await this.pick(same.folder);
+				const prior = (JSON.parse(same.confine) as Confine).wsl;
+				const alt = same.mode === "git" ? prior?.alt ?? (await this.fs.readFile(join(same.folder, ".git", "objects", "info", "alternates"), "utf8").then((t) => t.split(/\r?\n/u).filter((l) => l !== ""), () => [] as string[])) : [];
+				const places = prior?.places ?? ["node_modules"];
+				const picked = await this.pick(same.folder, { places, alt, project, files: 0, prev: prior });
+				if (picked.confine.wsl !== undefined) for (const place of places) await this.fs.mkdir(join(same.folder, place), { recursive: true } as never);
+				if (same.mode === "git") await this.fs.writeFile(join(same.folder, ".git", "objects", "info", "alternates"), `${(picked.alt ?? alt).join("\n")}\n`);
 				const refreshed = await this.refreshLive(same).catch((error: unknown) => { this.o.notice(`the earlier Workspace could not be refreshed from ${project} (${msg(error)})`); return 0; });
 				this.cas.tx(() => { this.cas.db.prepare("UPDATE workspaces SET key = ?, conv = NULL, state = 'open', hold = NULL, hold_detail = NULL, confine = ? WHERE id = ?").run(key, JSON.stringify(picked.confine), same.id); });
 				if (same.conv !== null) this.byConv.delete(same.conv);
@@ -362,6 +368,7 @@ export class Workspaces {
 			for (const i of items) groups.set(i.path.toLowerCase(), [...(groups.get(i.path.toLowerCase()) ?? []), i.path]);
 			for (const [, paths] of groups) if (paths.length > 1) { skipped.push(`${paths.join(", ")} (names equal under case folding)`); for (const p of paths) items.splice(items.findIndex((i) => i.path === p), 1); }
 		}
+		let wsl: WslConf | undefined;
 		try {
 			const gitFiles = mode === "git" && state.kind === "tree" ? await this.gitAllowList(state.gitDir) : [];
 			const total = items.length + gitFiles.length;
@@ -408,6 +415,7 @@ export class Workspaces {
 			// LINK_NAMES folders (node_modules) start as empty real folders: no link into the live project, ever.
 			for (const rel of links) await ensure(join(folder, rel));
 			if (mode === "git" && state.kind === "tree") await this.copyGit(state.gitDir, folder, gitFiles);
+			const alt = mode === "git" && state.kind === "tree" ? await this.altLines(state.gitDir) : [];
 			// Stat every copied path: a path missing or of another size after the copy becomes `skipped`.
 			const stats = new Map<string, { size: number; mtime: number }>();
 			await this.pool([...ents.values()].filter((e) => e.kind !== "skipped"), 16, async (e) => {
@@ -421,7 +429,14 @@ export class Workspaces {
 			const refs = mode === "git" && state.kind === "tree" ? await this.git.refIds(project) : [];
 			if (refs.length > 0 && (await this.git.missingObjects(project, refs)).length > 0) refuse("the live repository is missing objects that its own refs name; run git fsck there first");
 			const objectIds = [...ents.values()].flatMap((e) => (e.object === null ? [] : [e.object]));
-			const picked = await this.pick(folder);
+			const places = [...new Set([...links, "node_modules"])];
+			const picked = await this.pick(folder, { places, alt, project, files: items.length });
+			wsl = picked.confine.wsl;
+			if (wsl !== undefined) {
+				for (const place of places) await ensure(join(folder, place));
+				await this.fs.writeFile(join(folder, ".git", "objects", "info", "alternates"), `${(picked.alt ?? []).join("\n")}\n`).catch(() => undefined);
+				if (mode === "git") await this.liveLineEndings(project, folder);
+			}
 			let baseId = 0;
 			this.cas.tx(() => {
 				if (this.cas.missing(objectIds).length > 0) throw new WsRefusal("the store dropped objects of this copy while it was made; approve again");
@@ -445,7 +460,7 @@ export class Workspaces {
 			];
 			return { folder, notice: out };
 		} catch (error) {
-			await this.removeFolder(folder).catch(() => undefined);
+			await this.removeFolder(folder, wsl).catch(() => undefined);
 			throw error;
 		}
 	}
@@ -495,10 +510,21 @@ export class Workspaces {
 			await this.fs.mkdir(dirname(join(dest, f.rel)), { recursive: true } as never);
 			await this.fs.copyFile(join(gitDir, f.rel), join(dest, f.rel));
 		}
-		// Borrow the live repository's objects: its own object folder, then the alternates it already has.
+		await this.fs.writeFile(join(dest, "objects", "info", "alternates"), `${(await this.altLines(gitDir)).join("\n")}\n`);
+	}
+
+	/** Borrow the live repository's objects: its own object folder, then the alternates it already has. */
+	private async altLines(gitDir: string): Promise<string[]> {
 		const own = join(gitDir, "objects");
 		const inherited = await this.fs.readFile(join(own, "info", "alternates"), "utf8").then((t) => t.split(/\r?\n/u).filter((l) => l !== ""), () => [] as string[]);
-		await this.fs.writeFile(join(dest, "objects", "info", "alternates"), `${[own, ...inherited].map(posix).join("\n")}\n`);
+		return [own, ...inherited].map(posix);
+	}
+
+	/** Linux git does not read the Windows system config: copy the live repository's effective core.autocrlf and core.eol into the Workspace's own config. */
+	private async liveLineEndings(project: string, folder: string): Promise<void> {
+		const lines: string[] = [];
+		for (const name of ["autocrlf", "eol"]) { const r = await this.git.run(project, ["config", "--get", `core.${name}`]); if (r.code === 0 && r.out.toString("utf8").trim() !== "") lines.push(`\t${name} = ${JSON.stringify(r.out.toString("utf8").trim())}`); }
+		if (lines.length > 0) await this.fs.writeFile(join(folder, ".git", "config"), `${await this.fs.readFile(join(folder, ".git", "config"), "utf8")}[core]\n${lines.join("\n")}\n`);
 	}
 
 	/* --- manifests, scan and checkpoints ------------------------------------------------------------------------ */
@@ -633,9 +659,9 @@ export class Workspaces {
 	private confineDeps(): ConfineDeps { return { ...nativeDeps(this.o.guard(), this.wsRoot), ...this.o.confineDeps }; }
 
 	/** The confinement backend for a Workspace folder, chosen at each open and reopen (4.3.1). */
-	private pick(folder: string): ReturnType<typeof confineFor> {
+	private pick(folder: string, plan: WslPlan): ReturnType<typeof confineFor> {
 		const s = this.o.settings();
-		return confineFor({ confine: s.confine ?? "auto", network: s.network ?? true }, this.confineDeps(), folder);
+		return confineFor({ confine: s.confine ?? "auto", network: s.network ?? true, distro: s.wslDistro }, this.confineDeps(), folder, plan);
 	}
 
 	/** The open Workspace a shell cwd lies in, when its row names a backend: what ConfinedShellEnv wraps the command with. */
@@ -898,7 +924,7 @@ export class Workspaces {
 			const oversized = plan.oversize.length > 0;
 			this.cas.tx(() => { this.set(row.id, { state: oversized ? "discarded" : "merged", hold: null, hold_detail: oversized ? "nothing left to merge" : "no changes" }); });
 			await this.removeFolder(row.folder).catch((error: unknown) => this.o.notice(`the Workspace folder could not be removed: ${msg(error)}`));
-			return { text: [oversized ? `nothing merged: ${plan.oversize.length} changes over 64 MiB were left out; the Workspace was removed` : `Vesperia changed no files in ${row.project}; nothing was merged`, ...this.lwwLines(plan.lww).map((l) => l.trim())].join("\n"), state: oversized ? "discarded" : "merged" };
+			return { text: [oversized ? `nothing merged: ${plan.oversize.length} changes over 64 MiB were left out; the Workspace was removed` : `Vesperia changed no files in ${row.project}; nothing was merged`, ...LIMITED(plan.left.map((x) => `not merged: ${x.reason}: ${x.path}`)), ...this.lwwLines(plan.lww).map((l) => l.trim())].join("\n"), state: oversized ? "discarded" : "merged" };
 		}
 		try {
 			const r = await this.writer.merge({ ws: row.id, project: row.project, folder: row.folder, run, caseless: row.live_caseless === 1, rows, head: summaryHead(), redecide: plan.redecide });
@@ -1054,10 +1080,15 @@ export class Workspaces {
 		let names: string[];
 		try { names = await this.fs.readdir(dir); } catch { return; }
 		for (const name of names) if (!keep.has(name)) await this.removeFolder(join(dir, name)).catch((error: unknown) => this.o.notice(`could not remove ${join(dir, name)}: ${msg(error)}`));
+		// The ext4 folders of each distro a Workspace of this store used: ids with no open, held or conflicted row go (only the own home-hash folder is listed).
+		const wsl = this.confineDeps().wsl;
+		const used = new Map<string, WslConf>();
+		for (const row of this.rows("1 = 1")) { const c = (JSON.parse(row.confine) as Confine).wsl; if (c !== undefined) used.set(`${c.distro}/${c.user}`, c); }
+		if (wsl !== undefined) for (const c of used.values()) await wslSweep(wsl, c, keep).catch((error: unknown) => this.o.notice(`could not sweep the sandbox folders in ${c.distro}: ${msg(error)}`));
 	}
 
 	/** Never rmSync recursive over a Workspace: links are removed as links, then the real folders. */
-	async removeFolder(dir: string): Promise<void> {
+	async removeFolder(dir: string, known?: WslConf): Promise<void> {
 		const walk = async (d: string): Promise<void> => {
 			let list: import("node:fs").Dirent[];
 			try { list = await this.fs.readdir(d, { withFileTypes: true } as never) as unknown as import("node:fs").Dirent[]; } catch { return; }
@@ -1069,6 +1100,10 @@ export class Workspaces {
 		};
 		await walk(dir);
 		await this.fs.rm(dir, { recursive: true, force: true, maxRetries: 5 });
+		let wsl = known;
+		try { wsl ??= (JSON.parse(this.rows("folder = ?", dir)[0]?.confine ?? "{}") as Confine).wsl; } catch { /* no row */ }
+		const runner = this.confineDeps().wsl;
+		if (wsl !== undefined && runner !== undefined) await wslRemove(runner, wsl).catch((error: unknown) => this.o.notice(`the sandbox folder ${wsl.ext4} could not be removed: ${msg(error)}`));
 	}
 
 	/**
@@ -1156,7 +1191,7 @@ export class Workspaces {
 		const w = this.rows("project = ?", canonicalize(project))[0];
 		if (w === undefined) return [];
 		const commits = Number((this.cas.db.prepare("SELECT COUNT(*) AS n FROM commits WHERE workspace = ? AND kind = 'checkpoint'").get(w.id) as { n: number }).n);
-		return [`Workspace ${w.id}: ${w.state}${w.hold === null ? "" : ` (${holdText(w.hold, w.hold_detail)})`}${parked ? " [task parked]" : ""}`, `  mode ${w.mode}${from === undefined ? "" : ` (${from})`}, folder ${w.folder}, ${commits} checkpoint${commits === 1 ? "" : "s"}`, (() => { const c = JSON.parse(w.confine) as Confine; return c.name === "bubblewrap" ? `  shell confinement: bubblewrap, network ${c.net === false ? "off" : "on"}` : `  shell confinement: none; commands are not confined${c.why === undefined ? "" : ` (${c.why})`}`; })()];
+		return [`Workspace ${w.id}: ${w.state}${w.hold === null ? "" : ` (${holdText(w.hold, w.hold_detail)})`}${parked ? " [task parked]" : ""}`, `  mode ${w.mode}${from === undefined ? "" : ` (${from})`}, folder ${w.folder}, ${commits} checkpoint${commits === 1 ? "" : "s"}`, (() => { const c = JSON.parse(w.confine) as Confine; return c.name === "bubblewrap" ? `  shell confinement: bubblewrap${c.wsl === undefined ? "" : ` in WSL (${c.wsl.distro})`}, network ${c.net === false ? "off" : "on"}` : `  shell confinement: none; commands are not confined${c.why === undefined ? "" : ` (${c.why})`}`; })()];
 	}
 
 	/* --- undo -------------------------------------------------------------------------------------------------- */

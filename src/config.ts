@@ -177,7 +177,7 @@ export interface Settings {
 	/** deny: more protected roots. allow: project folders opened inside a deny root (P27f). */
 	guard?: { deny?: string[]; allow?: string[] };
 	/** Vesperia's Workspaces (P27d1). `enabled: false` runs her in place as 0.2.0 did; `nested` decides a project that is a repository subfolder, a worktree or a submodule. Both apply at the next /conclave approve. */
-	workspace?: { enabled?: boolean; nested?: "ask" | "copy" | "inplace"; confine?: "auto" | "none"; network?: boolean };
+	workspace?: { enabled?: boolean; nested?: "ask" | "copy" | "inplace"; confine?: "auto" | "none"; network?: boolean; wsl?: { distro?: string } };
 	tui?: { thinkingSteps?: string };
 	/** The plan tool (H5). Default true; false removes the tool and its injection at the next start. */
 	planning?: boolean;
@@ -310,11 +310,19 @@ export function validateSettings(value: unknown): Settings {
 	if (value.workspace !== undefined) {
 		if (!isObj(value.workspace)) issues.push("workspace: must be an object");
 		else {
-			known(value.workspace, ["enabled", "nested", "confine", "network"], "workspace");
+			known(value.workspace, ["enabled", "nested", "confine", "network", "wsl"], "workspace");
 			check.bool(value.workspace.enabled, "workspace.enabled");
 			check.bool(value.workspace.network, "workspace.network");
 			if (value.workspace.confine !== undefined && !["auto", "none"].includes(value.workspace.confine as string)) issues.push('workspace.confine: must be "auto" or "none"');
 			if (value.workspace.nested !== undefined && !["ask", "copy", "inplace"].includes(value.workspace.nested as string)) issues.push('workspace.nested: must be "ask", "copy" or "inplace"');
+			const wsl = value.workspace.wsl;
+			if (wsl !== undefined) {
+				if (!isObj(wsl)) issues.push("workspace.wsl: must be an object");
+				else {
+					known(wsl, ["distro"], "workspace.wsl");
+					if (wsl.distro !== undefined && !(typeof wsl.distro === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(wsl.distro) && !/^docker-desktop/iu.test(wsl.distro))) issues.push("workspace.wsl.distro: must be a WSL distribution name (letters, digits, . _ -), not docker-desktop");
+				}
+			}
 		}
 	}
 	if (value.web !== undefined) {
@@ -541,6 +549,7 @@ function securityKeys(settings: unknown): Record<string, unknown> {
 		"workspace.nested": isObj(settings.workspace) ? settings.workspace.nested : undefined,
 		"workspace.confine": isObj(settings.workspace) ? settings.workspace.confine : undefined,
 		"workspace.network": isObj(settings.workspace) ? settings.workspace.network : undefined,
+		"workspace.wsl.distro": isObj(settings.workspace) && isObj(settings.workspace.wsl) ? settings.workspace.wsl.distro : undefined,
 		"web.enabled": isObj(settings.web) ? settings.web.enabled : undefined,
 		"web.maxFetches": isObj(settings.web) ? settings.web.maxFetches : undefined,
 		"web.maxSearches": isObj(settings.web) ? settings.web.maxSearches : undefined,

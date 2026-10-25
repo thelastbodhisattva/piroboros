@@ -364,7 +364,9 @@ export function createGuard(deps: GuardDeps): Guard {
 		try {
 			if (cwd === undefined || cwd === "") return { allowed: false, reason: "this conversation has no working directory, so file access is refused" };
 			if (typeof path !== "string") return { allowed: false, reason: "the path argument is missing or not text" };
-			return isInside(canonicalize(cwd), canonicalize(path, cwd)) ? { allowed: true } : { allowed: false, reason: "this conversation may only touch files under its working directory" };
+			// A shell in WSL shows a Windows path as /mnt/<drive>/...; file tools want the Windows form.
+			const wsl = process.platform === "win32" ? /^\/mnt\/([a-z])\/(.*)$/iu.exec(path) : null;
+			return isInside(canonicalize(cwd), canonicalize(path, cwd)) ? { allowed: true } : { allowed: false, reason: `this conversation may only touch files under its working directory${wsl === null ? "" : `; ${path} is the Linux view of ${wsl[1]!.toUpperCase()}:\\${wsl[2]!.replaceAll("/", "\\")}, use that form`}` };
 		} catch {
 			return { allowed: false, reason: "the path could not be evaluated" };
 		}

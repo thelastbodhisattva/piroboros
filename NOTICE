@@ -29,7 +29,9 @@ Hermes Agent (NousResearch/hermes-agent, commit 7162533)
 LayerFS (Ephemeral-AI-Lab/layerfs, commit 4497b0c)
   MIT License, Copyright (c) 2026 Ephemeral-AI. Design credit and port of the merge decision model in src/ws/merge.ts and
   src/ws/lww.ts: the three-way line merge with the rule that a chunk changed identically on both sides is taken
-  once, and the .lww last-writer-wins rule file. The filesystem, its Store and its runtime are not used.
+  once, and the .lww last-writer-wins rule file. Also the pattern of src/ws/wsl.ts: every wsl.exe call is an
+  argument list with a minimal environment, and heavy folders such as node_modules live on the distribution's own
+  filesystem. The filesystem, its Store and its runtime are not used.
 
 pi-fff v0.11.0
   MIT License, by dmtrKovalenko (@ff-labs/pi-fff).

@@ -11,13 +11,30 @@
 
 ## Shell confinement
 
-With Workspaces on (the default), Vesperia's `bash` commands run inside bubblewrap on Linux when `bwrap` is on PATH and a self-test passes at the moment the Workspace opens. The choice is kept for that Workspace and made again when it is reopened. On Ubuntu install the `bubblewrap` package. Ubuntu 23.10 and later restrict unprivileged user namespaces by default; when that blocks bubblewrap the self-test fails and the start notice names the reason. macOS and Windows have no backend yet, so their commands are not confined, and the notice and `/conclave status` say so.
+With Workspaces on (the default), Vesperia's `bash` commands run inside bubblewrap on Linux when `bwrap` is on PATH and a self-test passes at the moment the Workspace opens. The choice is kept for that Workspace and made again when it is reopened. On Ubuntu install the `bubblewrap` package. Ubuntu 23.10 and later restrict unprivileged user namespaces by default; when that blocks bubblewrap the self-test fails and the start notice names the reason. On Windows the commands run inside bubblewrap in WSL (see below). macOS has no backend yet, so its commands are not confined, and the notice and `/conclave status` say so.
 
 - What a command sees: the whole system read-only, the Workspace read-write, an empty `/tmp`, and a home folder with nothing in it. `PIROBOROS_HOME`, `~/.pi`, `~/.ssh`, `~/.claude` and every `guard.deny` folder outside the home are hidden. Folders named on PATH under your home (`~/bin`, `~/.local/bin`, a Node version folder) stay visible read-only, so tools installed there keep working. The live `.git/objects` of the project is visible read-only so that git works in the Workspace.
 - What it cannot do: write outside the Workspace (the write fails, or lands in `/tmp` or the empty home folder and disappears when the command ends) or read your credentials. A live project inside your home is hidden; one outside your home, its `node_modules` included, is still readable by absolute path. Because `/tmp` and the home folder are fresh for every command, `git commit` there uses only the `user.name` and `user.email` kept from the live repository's local config.
 - Network: `workspace.network` (default `true`) lets installs work. With it on, a command can reach your network and send any file it can see. Set it to `false` to cut the network.
 - A command is passed to `bash -c` as one argument, so it can be at most 131,071 bytes and cannot hold a NUL byte; a longer one is refused with a message that suggests a script file in the Workspace. A command that runs past the timeout is killed with everything it started.
 - If a command cannot start, it fails with an error and is never run again without confinement. If bubblewrap was not usable when the Workspace opened, the start notice, her brief and `/conclave status` say the shell is not confined. `workspace.confine: "none"` turns confinement off on purpose.
+
+### The seccomp filter
+
+Every sandbox, native or in WSL, also loads a small seccomp filter (written in `src/ws/confine.ts`, no library). It does three things: `socket` and `socketpair` calls for the AF_VSOCK family fail with EAFNOSUPPORT, the three `io_uring` calls fail with EPERM, and a process using a CPU architecture other than x86_64 or aarch64, or the 32-bit x32 system calls, is killed. Everything else is allowed. AF_VSOCK is not scoped to the sandbox's network namespace, and in WSL the Windows host answers on it (one of its ports serves your drives), so closing it matters more than the network setting. The self-test checks that a vsock socket cannot be created; a filter that does not load or a failing self-test gives no sandbox, with the warning, never an unfiltered one.
+
+Residuals: with the network on, a command can still reach TCP ports on the Windows host and on your network, and can send any file it can see. 32-bit programs (x86 or ARM) and x32 programs do not run in the sandbox. The filter is not a general system call policy.
+
+### Windows: bubblewrap in WSL
+
+Install WSL 2 with a distribution whose default user is not root (Ubuntu 24.04 is the tested one), then in that distribution install `bubblewrap`, and Node 26.5 or later if your project needs `npm`. Do not use the `docker-desktop` distribution; it cannot run commands. Set `workspace.wsl.distro` to pick a distribution other than the default; the distribution and user are fixed when a Workspace opens and kept while they still resolve.
+
+- Commands run as that user through `wsl.exe` with an argument list, never a shell string, with a minimal environment (PATH, HOME, USER, LANG and a few terminal settings) built inside WSL: nothing from your Windows environment reaches them.
+- The Workspace stays on your Windows drive and the sandbox sees it through `/mnt/<drive>`. Everything else Windows-backed is hidden: your profile, `System32`, `PIROBOROS_HOME` and every `guard.deny` folder. A Windows program inside the Workspace does not run, and the WSL interop socket is masked.
+- `node_modules` lives in a folder in the distribution's own filesystem (under `~/.local/state/piroboros-ws`), so `npm ci` is fast; it is empty on the Windows side and is removed with the Workspace. Files a command writes there are not merged.
+- The Workspace folder is on drvfs, which is slow for many small files: expect the first `git status` in a project of 5,000 tracked files to take most of a minute and later ones a couple of seconds. The start notice gives an estimate above 1,000 files. A path inside the Workspace that the sandbox shows as `/mnt/c/...` is the Linux view of a Windows path; the file tools want the Windows form.
+- `workspace.network: true` gives the commands the WSL VM's network, which includes the Windows host. Set it to `false` to cut it.
+- A project on a network share (UNC path) is not confined, with the reason in the notice.
 
 ## Skills
 
