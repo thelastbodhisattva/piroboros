@@ -25,7 +25,7 @@ CREATE INDEX IF NOT EXISTS entries_object ON entries(object);
 CREATE TABLE IF NOT EXISTS workspaces(id INTEGER PRIMARY KEY, key TEXT UNIQUE, project TEXT, project_dev TEXT, project_ino TEXT, mode TEXT, git_head TEXT, refs TEXT, plan TEXT, base INTEGER, head INTEGER, folder TEXT, ws_caseless INTEGER, live_caseless INTEGER, confine TEXT, state TEXT, hold TEXT, hold_detail TEXT, conv INTEGER, created INTEGER);
 CREATE TABLE IF NOT EXISTS ws_stat(workspace INTEGER, path TEXT, size INTEGER, mtime INTEGER, hash TEXT, PRIMARY KEY(workspace, path));
 CREATE TABLE IF NOT EXISTS conflicts(workspace INTEGER, path TEXT, kind TEXT, ours TEXT, theirs TEXT, PRIMARY KEY(workspace, path));
-CREATE TABLE IF NOT EXISTS merges(id INTEGER PRIMARY KEY, workspace INTEGER, run TEXT, project TEXT, state TEXT, at INTEGER, pass INTEGER, summary TEXT);
+CREATE TABLE IF NOT EXISTS merges(id INTEGER PRIMARY KEY, workspace INTEGER, run TEXT, project TEXT, state TEXT, at INTEGER, pass INTEGER, summary TEXT, cleaned INTEGER);
 CREATE INDEX IF NOT EXISTS merges_run ON merges(workspace, run);
 CREATE TABLE IF NOT EXISTS merge_paths(merge INTEGER, seq INTEGER, path TEXT, from_path TEXT, op TEXT, pre TEXT, post TEXT, mode INTEGER, PRIMARY KEY(merge, seq));
 CREATE TABLE IF NOT EXISTS projects(project TEXT PRIMARY KEY, nested TEXT, at INTEGER);
@@ -66,6 +66,8 @@ export class Cas {
 		this.db.exec("PRAGMA synchronous = FULL");
 		if (pragma("synchronous") !== 2) throw new Error(`workspace store ${path} is not synchronous=FULL`);
 		this.db.exec(SCHEMA);
+		// 0.3.1: `cleaned` marks a done merge whose cleanup finished (recover skips it). A store from 0.3.0 gets the column, its done rows read NULL and are cleaned once more.
+		if (!(this.db.prepare("PRAGMA table_info(merges)").all() as { name: string }[]).some((c) => c.name === "cleaned")) this.db.exec("ALTER TABLE merges ADD COLUMN cleaned INTEGER");
 	}
 
 	close(): void {

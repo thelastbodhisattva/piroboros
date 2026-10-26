@@ -2,6 +2,19 @@
 
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-10-27
+
+### Security
+
+- A native bubblewrap sandbox no longer takes its read-only object folders from the Workspace's `.git/objects/info/alternates`, a file Vesperia can write. The list comes from your live repository when the Workspace opens or reopens, is stored with the Workspace, and only a folder named `objects` is shared. A path that is, or holds, a hidden folder is never bound back. A Workspace opened by 0.3.0 shares no object folders until it is reopened.
+
+### Fixed
+
+- The start-up recovery no longer repeats the cleanup of every merge that finished earlier. A finished merge is marked once its cleanup is done, so a start no longer runs it again or prints a line for each. The merge record keeps its state, so `/conclave undo` is unchanged. An existing store gets one new column and cleans each old merge one more time.
+- The 10 second limit on the sandbox's helper programs ignored the time a caller asked for, so `docker run` could be cut off at 10 seconds instead of 30.
+- A merge where a folder Vesperia needs is a file in your project reported a `preflight` hold, not a `type` conflict.
+- `docs/conclave.md` now names bubblewrap in WSL 2 among the confined setups.
+
 ## [0.3.0] - 2026-10-26
 
 ### Added

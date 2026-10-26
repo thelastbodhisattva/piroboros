@@ -14,7 +14,7 @@ import { execWsl, SelfTestError, wslDeps, wslPick, type WslConf, type WslDeps, t
 // one argument of `bash -c` (1.4.0 cannot select its stdin transport for bash, so the stdin wrapper waits for P27e2, where wsl.exe needs it).
 
 /** The row's `confine` column. */
-export interface Confine { name: "none" | "bubblewrap" | "docker"; bwrap?: string; net?: boolean; why?: string; wsl?: WslConf; docker?: DockerConf }
+export interface Confine { name: "none" | "bubblewrap" | "docker"; bwrap?: string; net?: boolean; why?: string; wsl?: WslConf; docker?: DockerConf; /** Native bubblewrap: the live repository's object folders, bound read-only. Absent in records from before 0.3.1, which then bind none until the next reopen. */ alt?: string[] }
 /** What ConfinedShellEnv gets for a shell cwd: the Workspace, its backend, and whether the backend was found unavailable (`mark` records that, and the run then ends held with code `backend`). */
 export interface Found { ws: string; confine: Confine; deps: ConfineDeps; down?: string; mark?: (reason: string) => void }
 
@@ -32,7 +32,7 @@ export interface ConfineDeps {
 	real(path: string): string | undefined;
 	read(path: string): string | undefined;
 	which(name: string): string | undefined;
-	run(program: string, args: string[]): Promise<{ code: number | null; out: string }>;
+	run(program: string, args: string[], ms?: number): Promise<{ code: number | null; out: string }>;
 	/** The WSL runner, on Windows only. */
 	wsl?: WslDeps;
 }
@@ -51,7 +51,7 @@ export function nativeDeps(cfg: GuardConfig, wsRoot: string): ConfineDeps {
 		real: (path) => { try { return realpathSync(path); } catch { return undefined; } },
 		read: (path) => { try { return readFileSync(path, "utf8"); } catch { return undefined; } },
 		which: (name) => (process.env.PATH ?? "").split(delimiter).map((dir) => posix.join(dir, name)).find((p) => existsSync(p)),
-		run: (program, args) => new Promise((done) => execFile(program, args, { timeout: 10_000, env: { PATH: process.env.PATH ?? "" } }, (e, out, errs) => done({ code: e === null ? 0 : typeof e.code === "number" ? e.code : null, out: `${out}${errs}` }))),
+		run: (program, args, ms = 10_000) => new Promise((done) => execFile(program, args, { timeout: ms, env: { PATH: process.env.PATH ?? "" } }, (e, out, errs) => done({ code: e === null ? 0 : typeof e.code === "number" ? e.code : null, out: `${out}${errs}` }))),
 	};
 }
 
@@ -86,7 +86,7 @@ export function seccompExec(bwrap: string, args: string[]): string[] {
  * the Windows-backed mounts are masked, `/init` is emptied, the live objects come in `alt` (already checked and translated), `nm` binds ext4 folders over
  * Workspace folders, `env` is the whole environment and `extra` are more read-only binds.
  */
-export function bwrapArgs(d: ConfineDeps, c: { ws: string; cwd: string; net: boolean; path: string; wsl?: { mounts: string[]; alt: string[]; nm: string[][]; env: string[][]; extra: string[] } }, inner: string[]): { args: string[]; refused: string[] } {
+export function bwrapArgs(d: ConfineDeps, c: { ws: string; cwd: string; net: boolean; path: string; alt?: string[]; wsl?: { mounts: string[]; alt: string[]; nm: string[][]; env: string[][]; extra: string[] } }, inner: string[]): { args: string[]; refused: string[] } {
 	const masks: string[] = [];
 	for (const mask of [d.home, "/run", "/var/run", ...(c.wsl?.mounts ?? []), d.piroHome, ...d.deny]) {
 		const r = d.real(mask);
@@ -98,10 +98,13 @@ export function bwrapArgs(d: ConfineDeps, c: { ws: string; cwd: string; net: boo
 	const need = (path: string): void => {
 		const r = d.real(path);
 		if (r === undefined || binds.some(([, dest]) => dest === r)) return;
-		if (!d.allowed(r) || protectedRoots.some((root) => within(r, root))) { if (masks.some((m) => within(m, r))) refused.push(path); return; }
+		// A path that is, or holds, a mask or a protected root never binds: that would put back what the mask hid.
+		const holds = masks.some((m) => within(r, m));
+		if (holds || !d.allowed(r) || protectedRoots.some((root) => within(r, root))) { if (holds || masks.some((m) => within(m, r))) refused.push(path); return; }
 		binds.push([r, r]);
 	};
-	for (const line of c.wsl?.alt ?? (d.read(posix.join(c.ws, ".git/objects/info/alternates")) ?? "").split(/\r?\n/u)) if (line.startsWith("/")) need(line);
+	// The object folders come from the stored record (`c.alt`, built from the live repository), never from the Workspace's own alternates file, which Vesperia can write.
+	for (const line of c.wsl?.alt ?? c.alt ?? []) if (line.startsWith("/") && posix.basename(d.real(line) ?? "") === "objects") need(line);
 	const resolv = c.net ? d.real("/etc/resolv.conf") : undefined;
 	if (resolv !== undefined && masks.some((m) => within(m, resolv))) need(c.wsl === undefined ? posix.dirname(resolv) : resolv);
 	// PATH entries under the home: the entry, and its parent only for `<parent>/bin` where the parent is neither the home nor a direct child of it.
@@ -154,11 +157,11 @@ async function confineLocal(confine: "auto" | "none", network: boolean, distro: 
 	if (d.platform !== "linux") return none(`bubblewrap needs Linux; this is ${d.platform}`);
 	const bwrap = d.which("bwrap");
 	if (bwrap === undefined) return none("bubblewrap is not installed (package bubblewrap)");
-	const test = bwrapArgs(d, { ws, cwd: ws, net: s.network, path: process.env.PATH ?? "" }, ["sh", "-c", SELF_TEST, "sh", ws, d.piroHome, s.network ? "1" : "0"]);
+	const test = bwrapArgs(d, { ws, cwd: ws, net: s.network, path: process.env.PATH ?? "", alt: plan?.alt }, ["sh", "-c", SELF_TEST, "sh", ws, d.piroHome, s.network ? "1" : "0"]);
 	const [program, ...rest] = seccompExec(bwrap, test.args);
 	const ran = await d.run(program!, rest);
 	if (ran.code !== 0) return none(ran.out.trim().split("\n")[0] || "bwrap did not start", true);
-	return { confine: { name: "bubblewrap", bwrap, net: s.network }, label: "bubblewrap", notice: [...(s.network ? ["Network: on. Confined commands can reach your network, and can send any file they can see."] : []), ...(test.refused.length > 0 ? [`Left hidden in the sandbox because they are protected: ${test.refused.join(", ")}`] : [])] };
+	return { confine: { name: "bubblewrap", bwrap, net: s.network, alt: plan?.alt ?? [] }, label: "bubblewrap", notice: [...(s.network ? ["Network: on. Confined commands can reach your network, and can send any file they can see."] : []), ...(test.refused.length > 0 ? [`Left hidden in the sandbox because they are protected: ${test.refused.join(", ")}`] : [])] };
 }
 
 /** Wraps each command of a Workspace whose row says bubblewrap; every other command runs as before. A command a chosen backend cannot start is an error, never a rerun. */
@@ -181,7 +184,7 @@ export class ConfinedShellEnv extends ShellEnv {
 		if (w.confine.docker !== undefined) result = await execDocker(w, cwd, command, options, context, (argv, o) => super.exec(argv, o, context));
 		else if (w.confine.wsl !== undefined) result = await execWsl(w, cwd, command, options, context);
 		else {
-			const { args } = bwrapArgs(w.deps, { ws: w.ws, cwd, net: w.confine.net !== false, path: options?.env?.PATH ?? "" }, ["bash", "-c", command]);
+			const { args } = bwrapArgs(w.deps, { ws: w.ws, cwd, net: w.confine.net !== false, path: options?.env?.PATH ?? "", alt: w.confine.alt }, ["bash", "-c", command]);
 			result = await super.exec(seccompExec(w.confine.bwrap!, args), options, context);
 			if (!result.ok && result.error.code === "spawn_error") result = unavailable(result.error.message);
 		}

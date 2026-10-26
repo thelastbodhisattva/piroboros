@@ -288,7 +288,9 @@ export class Workspaces {
 				}
 				const earlier = JSON.parse(same.confine) as Confine;
 				const prior = earlier.wsl ?? earlier.docker;
-				const alt = same.mode === "git" ? prior?.alt ?? (await this.fs.readFile(join(same.folder, ".git", "objects", "info", "alternates"), "utf8").then((t) => t.split(/\r?\n/u).filter((l) => l !== ""), () => [] as string[])) : [];
+				// The object folders come from the live repository, never from the Workspace's own alternates file (Vesperia can write it). If the live repository cannot be read, the stored list stands.
+				const live = same.mode === "git" ? await this.git.state(project).catch(() => undefined) : undefined;
+				const alt = same.mode !== "git" ? [] : live?.kind === "tree" ? await this.altLines(live.gitDir) : prior?.alt ?? earlier.alt ?? [];
 				const places = prior?.places ?? ["node_modules"];
 				const picked = await this.pick(same.folder, { places, alt, project, files: 0, prev: earlier.wsl, prevDocker: earlier.docker });
 				if (onWsl(picked.confine)) for (const place of places) await this.fs.mkdir(join(same.folder, place), { recursive: true } as never);
@@ -879,7 +881,7 @@ export class Workspaces {
 			} else conflict(bPath, "case", b.ours, { hash: theirs.kind === "file" ? theirs.hash : null, size: 0 });
 		}
 		// Folder rows for every path the merge creates, parents before children; deletes and renames, then writes and creates.
-		for (const r of rows) if (r.op === "write" || r.op === "create" || r.op === "rename") { const bad = await dirFor(r.path); if (bad !== undefined) { rows.splice(rows.indexOf(r), 1); conflict(r.path, "type", entryOf(r.path)); } }
+		for (const r of [...rows]) if (r.op === "write" || r.op === "create" || r.op === "rename") { const bad = await dirFor(r.path); if (bad !== undefined) { rows.splice(rows.indexOf(r), 1); conflict(r.path, "type", entryOf(r.path)); } }
 		const ordered: Row[] = [...[...mkdirs].sort((a, b) => a.split("/").length - b.split("/").length).map((p) => makeRow(p, null, "mkdir", null, null)), ...rows.filter((r) => r.op === "delete" || r.op === "rename"), ...rows.filter((r) => r.op === "write" || r.op === "create")];
 		ordered.forEach((r, i) => { r.seq = i + 1; });
 		// Ours bytes for the conflicts, stored before anything else can change them.

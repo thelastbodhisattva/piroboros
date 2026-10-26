@@ -18,7 +18,7 @@ const SELF_TEST = 'm=/work/.piroboros-selftest; : > "$m" || { echo "the Workspac
 
 /** One docker call: `args` follow the fixed `--config <folder>` (and on Windows the fixed socket); only code constants and computed paths and IDs appear in them. */
 export async function docker(d: ConfineDeps, c: DockerConf, args: string[], ms = 10_000): Promise<{ code: number | null; out: string }> {
-	if (c.remote === undefined) return d.run(c.cli, ["--config", c.config, ...args]);
+	if (c.remote === undefined) return d.run(c.cli, ["--config", c.config, ...args], ms);
 	const r = await d.wsl!.run(via(c.remote, ["/usr/bin/docker", "--config", c.config, "-H", SOCK, ...args]), { timeoutMs: ms });
 	return { code: r.timedOut ? null : r.code, out: `${r.out.toString("utf8")}${r.err}` };
 }

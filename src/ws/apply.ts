@@ -307,8 +307,10 @@ export class Writer {
 				await (this.d.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))))(1_000);
 			}
 		}
-		await this.cleanup(id, input.project, input.caseless, new Map(), true, lines).catch((error: unknown) => lines.push(`cleanup: ${message(error)}`));
-		await this.d.removeFolder(input.folder).catch((error: unknown) => lines.push(`the Workspace folder could not be removed: ${message(error)}`));
+		let clean = true;
+		await this.cleanup(id, input.project, input.caseless, new Map(), true, lines).catch((error: unknown) => { clean = false; lines.push(`cleanup: ${message(error)}`); });
+		await this.d.removeFolder(input.folder).catch((error: unknown) => { clean = false; lines.push(`the Workspace folder could not be removed: ${message(error)}`); });
+		if (clean) try { this.db.prepare("UPDATE merges SET cleaned = 1 WHERE id = ?").run(id); } catch { /* recover cleans up again */ }
 		return { id, state: "done", summary: summary(), lines };
 	}
 
@@ -634,7 +636,7 @@ export class Writer {
 	 */
 	async recover(): Promise<string[]> {
 		const out: string[] = [];
-		const records = this.db.prepare("SELECT m.id, m.state, m.workspace AS ws, m.project, w.folder, w.live_caseless AS caseless FROM merges m LEFT JOIN workspaces w ON w.id = m.workspace WHERE m.state IN ('planned', 'writing', 'done', 'undoing') ORDER BY m.id").all() as { id: number; state: string; ws: number; project: string; folder: string | null; caseless: number }[];
+		const records = this.db.prepare("SELECT m.id, m.state, m.workspace AS ws, m.project, w.folder, w.live_caseless AS caseless FROM merges m LEFT JOIN workspaces w ON w.id = m.workspace WHERE m.state IN ('planned', 'writing', 'undoing') OR (m.state = 'done' AND m.cleaned IS NULL) ORDER BY m.id").all() as { id: number; state: string; ws: number; project: string; folder: string | null; caseless: number }[];
 		for (const r of records) {
 			const caseless = r.caseless === 1;
 			try {
@@ -642,6 +644,7 @@ export class Writer {
 					const lines: string[] = [];
 					await this.cleanup(r.id, r.project, caseless, new Map(), true, lines);
 					if (r.folder !== null) await this.d.removeFolder(r.folder);
+					this.db.prepare("UPDATE merges SET cleaned = 1 WHERE id = ?").run(r.id);
 					out.push(`merge ${r.id}: finished cleaning up${lines.length === 0 ? "" : `; ${lines.join("; ")}`}`);
 				} else if (r.state === "undoing") {
 					const res = await this.finishUndo(r.id, r.project, caseless);
