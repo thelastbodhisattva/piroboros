@@ -660,7 +660,3 @@ export function withAgentSelection(base: RankingPolicy, profile: AgentBriefingPr
 	if (identical) return base;
 	return Object.freeze({ ...base, selection: Object.freeze({ ...base.selection, sectionShares: profile.sectionShares }) });
 }
-
-export function policyById(policyId: string): RankingPolicy | undefined {
-	return POLICIES.find((entry) => entry.policyId === policyId);
-}

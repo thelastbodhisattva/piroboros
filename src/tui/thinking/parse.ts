@@ -1005,10 +1005,6 @@ function summarizeThinkingTextDetailed(text: string, fallback = "Reasoning is hi
 	};
 }
 
-export function summarizeThinkingText(text: string, fallback = "Reasoning is hidden by the provider."): string {
-	return summarizeThinkingTextDetailed(text, fallback).summary;
-}
-
 export function inferThinkingRole(text: string): ThinkingSemanticRole {
 	const haystack = ` ${normalizeNewlines(text).toLowerCase()} `;
 	const referenceOnlyFailureCue = FAILURE_REFERENCE_CONTEXT_RE.test(haystack)

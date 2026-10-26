@@ -58,7 +58,7 @@ import { inferIntentHypotheses, leadingQueryTerms, type IntentHypothesisSet } fr
 import { deriveKnowledgeRequirements, type KnowledgeRequirement } from "./requirements.ts";
 import { openTrace, readTrace, buildAgentLineage, type TraceWriter } from "./trace.ts";
 import { runProgressiveRetrieval, type ProgressiveRetrievalResult, type ProgressiveConfig } from "./progressive.ts";
-import { EARLY_EXITS, SCHEMA_VERSION, type ArtifactEnvelope, type Claim, type EarlyExit, type PlannedQuery, type RetrievalGap, type RetrievalState, type SourceId, type TraceEvent } from "./types.ts";
+import { SCHEMA_VERSION, type ArtifactEnvelope, type Claim, type EarlyExit, type PlannedQuery, type RetrievalGap, type RetrievalState, type SourceId, type TraceEvent } from "./types.ts";
 import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { redactSensitive } from "../../redact.ts";
@@ -110,11 +110,7 @@ function recordSourceFailure(session: SessionState, sourceId: SourceId, now: num
 
 /**
  * `DELIVERED` plus spec §7's six early terminations. Every run ends as exactly one of these.
- *
- * Built from `EARLY_EXITS` rather than retyped, so a seventh termination added to the domain model
- * becomes a compile error here instead of an outcome the orchestrator can never produce.
  */
-export const RUN_OUTCOMES = ["DELIVERED", ...EARLY_EXITS] as const;
 export type RunOutcome = "DELIVERED" | EarlyExit;
 
 export interface SourceOutcome {

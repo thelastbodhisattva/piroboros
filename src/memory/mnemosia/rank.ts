@@ -32,7 +32,7 @@
  */
 
 import { resolveAgent } from "./agents.ts";
-import { MODE_CONFIGS, RANK_SIGNALS, resolvePolicy, type AuthorityClass, type PolicyResolution, type RankSignal, type RankingPolicy, type SignalWeights } from "./policy.ts";
+import { MODE_CONFIGS, RANK_SIGNALS, resolvePolicy, type AuthorityClass, type PolicyResolution, type RankingPolicy, type SignalWeights } from "./policy.ts";
 import { buildProvenanceGraph, provenanceOf, type GroundingState, type ProvenanceGraph } from "./provenance.ts";
 import type { QualifierHit } from "./qualifiers.ts";
 import type { SearchTokenizer, TaskAnalysis } from "./task.ts";
@@ -715,9 +715,4 @@ export function rankCandidates(input: RankInput): RankResult {
 		graph,
 		stats: { scored: candidates.length, meanUtility: candidates.length === 0 ? 0 : total / candidates.length, maxUtility: max, minUtility: min, byAuthorityClass },
 	};
-}
-
-/** Convenience for the trace and for `explainDecision`: the signal vector as an ordered list. */
-export function signalBreakdown(candidate: RankedCandidate): Array<{ signal: RankSignal; value: number; weight: number; contribution: number }> {
-	return RANK_SIGNALS.map((signal) => ({ signal, value: candidate.score[signal], weight: candidate.weights[signal], contribution: candidate.weights[signal] * candidate.score[signal] }));
 }

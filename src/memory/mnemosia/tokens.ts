@@ -29,13 +29,6 @@ export function estimateTokens(text: string): number {
 	return Math.ceil(text.length / CHARS_PER_TOKEN);
 }
 
-/** Sum of the parts, computed per part. Summing lengths first would round only once and under-count. */
-export function estimateTokensOfAll(texts: readonly string[]): number {
-	let total = 0;
-	for (const text of texts) total += estimateTokens(text);
-	return total;
-}
-
 /**
  * A budget in flight. Immutable: every arithmetic operation returns a new value, so a selection
  * loop cannot lose track of what it spent by mutating a shared object, and a rejected candidate
@@ -65,13 +58,9 @@ export function hardRemaining(budget: Budget): number {
 	return Math.max(0, budget.total - budget.used);
 }
 
-/** Does `tokens` fit the selectable pool? Mandatory placement asks `fitsHard` instead. */
+/** Does `tokens` fit the selectable pool? */
 export function fits(budget: Budget, tokens: number): boolean {
 	return tokens <= selectableRemaining(budget);
-}
-
-export function fitsHard(budget: Budget, tokens: number): boolean {
-	return tokens <= hardRemaining(budget);
 }
 
 /** Spending past `total` is a programming error, not a value to clamp: the caller must test first. */

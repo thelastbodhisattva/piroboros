@@ -19,10 +19,8 @@
  *
  * 1. **Off by default.** `deps.gate ?? DEFAULT_RERANK_GATE` and the default is frozen with
  *    `rerankEnabled: false`. A disabled call returns the input array *by identity* and never touches
- *    `deps.model` — measured by a model that counts its own calls. The only constructor of an
- *    enabled gate is `enableReranking(enabledBy, justification, rerankerVersion)`, all three
- *    required and non-empty, and `test/mutate.test.ts`'s source sweep asserts that nothing under
- *    `src/` calls it or builds the enabled literal by hand.
+ *    `deps.model` — measured by a model that counts its own calls. No code under
+ *    `src/` constructs an enabled gate.
  * 2. **Strictly after deterministic filtering.** The input is `RankedCandidate[]`, which `rank.ts`
  *    produces from `filters.accepted` — a rejected claim is never scored, so it is never in the
  *    array this function receives. The orchestrator calls it *after* the mode's candidate cap for
@@ -47,9 +45,7 @@
  * > (`package.json` has zero dependencies, deliberately). `RerankModel` is therefore a *seam*: the
  * > fallback path, the permutation guard, the retry bound and the trace record are exercised against
  * > fakes, and the sentence "a real model was asked to reorder real candidates and the result was
- * > better" is **not** claimed anywhere. `REGISTERED_RERANKERS` holds exactly one entry, and its
- * > version string says what it is.
- */
+ * > better" is **not** claimed anywhere. */
 
 import { compareCandidates, type RankedCandidate } from "./rank.ts";
 import type { TraceWriter } from "./trace.ts";
@@ -93,17 +89,6 @@ export const DEFAULT_RERANK_GATE: RerankGate = Object.freeze({
 	justification: null,
 	rerankerVersion: null,
 });
-
-/**
- * The single constructor of an enabled gate. Nothing under `src/` calls it; `test/mutate.test.ts`
- * proves that by reading the source tree, and `test/rerank.test.ts` extends the same sweep here.
- */
-export function enableReranking(enabledBy: string, justification: string, rerankerVersion: string): RerankGate {
-	if (typeof enabledBy !== "string" || enabledBy.trim().length === 0) throw new Error("enableReranking requires a named enabler; spec §25 admits model-assisted reranking only after strong offline evaluation, and an anonymous activation is not an approval");
-	if (typeof justification !== "string" || justification.trim().length === 0) throw new Error("enableReranking requires a justification; the Phase 1 gate is 10/11 and the Phase 2 gate is 3/4, so any activation has to say what it is for");
-	if (typeof rerankerVersion !== "string" || rerankerVersion.trim().length === 0) throw new Error("enableReranking requires a reranker version; an approval that does not name one authorizes whatever the provider ships next");
-	return Object.freeze({ schemaVersion: SCHEMA_VERSION.rerankGate, rerankEnabled: true, enabledBy: enabledBy.trim(), justification: justification.trim(), rerankerVersion: rerankerVersion.trim() });
-}
 
 /* ------------------------------------------------------------------------------------------------
  * The seam
@@ -149,17 +134,6 @@ export interface RerankModel {
 	readonly version: string;
 	rerank(request: RerankRequest, attempt: number): RerankResponse | null;
 }
-
-/**
- * The reranker registry. One entry, and its version string is the honest description of it.
- *
- * A registry with one unbuilt member looks like ceremony until you ask what the alternative is: the
- * gate names a version, `applyReranking` refuses a response whose version is not the gate's, and a
- * version nobody wrote down cannot be approved. An empty registry would make the version field
- * unverifiable; a registry with a plausible-looking `mnemosia/reranker@1` in it would be design §26's
- * placeholder abstraction, claiming a model that does not exist.
- */
-export const REGISTERED_RERANKERS: readonly string[] = Object.freeze(["mnemosia/reranker@0-unbuilt"]);
 
 /** One retry, following `mutate.ts`'s rebase-and-retry-once. See property 5 in the header. */
 export const MAX_RERANK_ATTEMPTS = 2;

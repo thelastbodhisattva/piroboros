@@ -108,7 +108,6 @@ export class TurnLoop {
 	private halt = new AbortController();
 	private unsubscribe: (() => void) | undefined;
 	private readonly settled = new Map<string, Promise<SubmissionRecord | undefined>>();
-	private idleWaiters: Array<() => void> = [];
 
 	constructor(deps: TurnLoopDeps) {
 		this.deps = deps;
@@ -146,16 +145,6 @@ export class TurnLoop {
 		return this.settled.get(itemId);
 	}
 
-	/** Resolves once a pass has found nothing left to do. */
-	async whenQuiet(): Promise<void> {
-		for (;;) {
-			const pending = await this.deps.harness.snapshot(PendingDoc, ctx);
-			const held = (await this.deps.holdReports?.()) === true;
-			if ((pending?.items.filter((item) => !held || item.source === "user").length ?? 0) === 0 && this.running === undefined) return;
-			await new Promise<void>((resolve) => { this.idleWaiters.push(resolve); setTimeout(resolve, 50); });
-		}
-	}
-
 	private async drain(): Promise<void> {
 		while (this.dirty && !this.stopped) {
 			this.dirty = false;
@@ -167,9 +156,6 @@ export class TurnLoop {
 				this.deps.onStatus?.({ kind: "error", message: error instanceof Error ? error.message : String(error) });
 			}
 		}
-		const waiters = this.idleWaiters;
-		this.idleWaiters = [];
-		for (const resolve of waiters) resolve();
 	}
 
 	/** Closing the runtime rejects the waits of a running turn with this error; it is not a failure of the turn. */

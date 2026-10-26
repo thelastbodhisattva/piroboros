@@ -1,6 +1,6 @@
 {
   "name": "piroboros",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "A Windows-first TUI agent harness with one durable chat that never ends.",
   "license": "MIT",
   "author": "samael",
@@ -62,7 +62,6 @@
   "devDependencies": {
     "@types/node": "26.6.4",
     "@types/react": "19.3.0",
-    "baseline-browser-mapping": "^2.11.30",
     "typescript": "7.0.2"
   },
   "overrides": {

@@ -2,6 +2,20 @@
 
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.2] - 2026-10-27
+
+### Changed
+
+- Reading a Workspace's changes before a merge loads the file lists of the Workspace once instead of twice. With 24,000 files and 40 checkpoints, that step went from about 485 ms to about 255 ms, and the whole plan from about 2.07 s to about 1.50 s.
+- Hashing a small file reads it into a buffer sized to the file instead of a fresh 1 MiB buffer. Hashing 2,000 files of 2 KiB went from about 730 ms to about 400 ms. The hashes are the same.
+- Reading a repository's state runs one `git rev-parse` for the top level and the git folder instead of two, and opening a Workspace no longer asks git for HEAD a second time. A failure still names the same git call as before.
+- A few repeated statements and patterns in the merge code are built once instead of once per file.
+
+### Removed
+
+- Unused internal code: the policy change packet and rollback plan helpers, the reranking switch, a few unused helpers and types in Mnemosia, Akashic and the thinking panel, several unread fields and parameters in the Workspace and learning code, and an uncalled wait in the chat turn queue. No command, setting, file format or message changed.
+- The development dependency `baseline-browser-mapping`.
+
 ## [0.3.1] - 2026-10-27
 
 ### Security

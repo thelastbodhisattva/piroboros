@@ -22,16 +22,15 @@ export interface RowResult { seq: number; path: string; outcome: Outcome; reason
 export class HoldError extends Error {
 	readonly code: "preflight" | "oversize";
 	readonly detail: string;
-	constructor(code: "preflight" | "oversize", detail: string, message = detail) {
-		super(message);
+	constructor(code: "preflight" | "oversize", detail: string) {
+		super(detail);
 		this.code = code;
 		this.detail = detail;
 	}
 }
 /** A pre-flight re-decision found a conflict: the merge writes nothing. */
 export class ConflictFound extends Error {
-	readonly path: string;
-	constructor(path: string) { super(`conflict at ${path}`); this.path = path; }
+	constructor(path: string) { super(`conflict at ${path}`); }
 }
 
 export type Redecided = "drop" | "conflict" | "oversize" | { row: Row };
@@ -53,7 +52,6 @@ export interface MergeResult {
 	id: number | undefined;
 	state: "done" | "rolled back" | "rollback failed" | "pending";
 	summary: string;
-	lines: string[];
 }
 
 export interface WriterDeps {
@@ -119,18 +117,20 @@ export class Writer {
 		try { info = await this.d.fs.lstat(abs); } catch (error) { if (code(error) === "ENOENT" || code(error) === "ENOTDIR") return { kind: "absent" }; throw error; }
 		if (info.isDirectory()) return { kind: "dir" };
 		if (!info.isFile()) return { kind: "other" };
-		return { kind: "file", hash: await this.hashFile(abs), size: info.size, mode: info.mode & 0o777 };
+		return { kind: "file", hash: await this.hashFile(abs, info.size), size: info.size, mode: info.mode & 0o777 };
 	}
 
-	async hashFile(abs: string): Promise<string> {
+	/** `size`, when the caller has just stat-ed the file, starts a small file on a small read buffer (a full read grows it to 1 MiB); the hash does not depend on it. */
+	async hashFile(abs: string, size?: number): Promise<string> {
 		const fh = await this.d.fs.open(abs, "r");
 		try {
 			const hash = createHash("sha256");
-			const buf = Buffer.allocUnsafe(1 << 20);
+			let buf = Buffer.allocUnsafe(size === undefined ? 1 << 20 : Math.min(1 << 20, size + 1));
 			for (;;) {
 				const { bytesRead } = await fh.read(buf, 0, buf.length, null);
 				if (bytesRead === 0) return hash.digest("hex");
 				hash.update(buf.subarray(0, bytesRead));
+				if (bytesRead === buf.length && buf.length < 1 << 20) buf = Buffer.allocUnsafe(1 << 20);
 			}
 		} finally { await fh.close(); }
 	}
@@ -311,7 +311,7 @@ export class Writer {
 		await this.cleanup(id, input.project, input.caseless, new Map(), true, lines).catch((error: unknown) => { clean = false; lines.push(`cleanup: ${message(error)}`); });
 		await this.d.removeFolder(input.folder).catch((error: unknown) => { clean = false; lines.push(`the Workspace folder could not be removed: ${message(error)}`); });
 		if (clean) try { this.db.prepare("UPDATE merges SET cleaned = 1 WHERE id = ?").run(id); } catch { /* recover cleans up again */ }
-		return { id, state: "done", summary: summary(), lines };
+		return { id, state: "done", summary: summary() };
 	}
 
 	/** Move a live path aside and check it is what the plan saw; put it back and stop when it is not. */
@@ -532,7 +532,7 @@ export class Writer {
 	}
 
 	/** One reverse pass: `pass` is incremented first, rows run in descending seq, and a failing row never stops the next. */
-	async reverse(id: number, project: string, caseless: boolean): Promise<{ results: RowResult[]; lines: string[]; pass: number }> {
+	async reverse(id: number, project: string, caseless: boolean): Promise<{ results: RowResult[]; lines: string[] }> {
 		const pass = this.nextPass(id);
 		this.startPass();
 		const results: RowResult[] = [];
@@ -571,7 +571,7 @@ export class Writer {
 				result.reason = message(error);
 			}
 		}
-		return { results, lines, pass };
+		return { results, lines };
 	}
 
 	/** Delete the record's tmp files, and its old files whose bytes the snapshot or the merge's output still holds; keep and list the rest. */
@@ -583,13 +583,15 @@ export class Writer {
 				folders.add(row.op === "mkdir" ? await this.name(project, rel, caseless) : dirname(await this.name(project, rel, caseless)));
 			}
 		}
+		const tmpRe = new RegExp(`\\.piroboros-tmp-${id}-`, "u");
+		const oldRe = new RegExp(`^\\.(.+)\\.piroboros-old-${id}-\\d+$`, "u");
 		for (const dir of folders) {
 			let names: string[];
 			try { names = await this.d.fs.readdir(dir); } catch { continue; }
 			for (const name of names) {
 				const abs = join(dir, name);
-				if (new RegExp(`\\.piroboros-tmp-${id}-`, "u").test(name)) { await this.retry(abs, () => this.d.fs.unlink(abs)).catch((error: unknown) => lines.push(`left behind: ${abs} (${message(error)})`)); continue; }
-				const match = new RegExp(`^\\.(.+)\\.piroboros-old-${id}-\\d+$`, "u").exec(name);
+				if (tmpRe.test(name)) { await this.retry(abs, () => this.d.fs.unlink(abs)).catch((error: unknown) => lines.push(`left behind: ${abs} (${message(error)})`)); continue; }
+				const match = oldRe.exec(name);
 				if (match === null) continue;
 				const row = rows.find((r) => [r.path, r.from].some((p) => p !== null && basename(p).toLowerCase() === match[1]!.toLowerCase()));
 				const hash = await this.live(abs).then((s) => (s.kind === "file" ? s.hash : undefined)).catch(() => undefined);
@@ -613,7 +615,7 @@ export class Writer {
 	private async rollback(id: number, input: Pick<MergeInput, "ws" | "project" | "caseless">, reason: string, lines: string[]): Promise<MergeResult> {
 		let pass: Awaited<ReturnType<Writer["reverse"]>>;
 		try { pass = await this.reverse(id, input.project, input.caseless); } catch (error) {
-			return { id, state: "pending", summary: `merge ${id} stopped (${reason}) and its rollback did not start: ${message(error)}`, lines };
+			return { id, state: "pending", summary: `merge ${id} stopped (${reason}) and its rollback did not start: ${message(error)}` };
 		}
 		const { failed, map } = this.ends(pass.results);
 		await this.cleanup(id, input.project, input.caseless, map, false, pass.lines);
@@ -624,8 +626,8 @@ export class Writer {
 				this.db.prepare("UPDATE merges SET state = ?, summary = ? WHERE id = ?").run(state, summary, id);
 				this.db.prepare("UPDATE workspaces SET state = 'held', hold = 'rollback', hold_detail = ? WHERE id = ?").run(String(id), input.ws);
 			});
-		} catch (error) { return { id, state: "pending", summary: `merge ${id} stopped (${reason}); its rollback ran but could not be recorded: ${message(error)}`, lines }; }
-		return { id, state, summary, lines: [...pass.lines, ...lines] };
+		} catch (error) { return { id, state: "pending", summary: `merge ${id} stopped (${reason}); its rollback ran but could not be recorded: ${message(error)}` }; }
+		return { id, state, summary };
 	}
 
 	/* --- recovery and undo ------------------------------------------------------------------------------------ */

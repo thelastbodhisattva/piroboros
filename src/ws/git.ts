@@ -77,6 +77,10 @@ export class HostGit {
 		const [bare, inGitDir] = flags.out.toString("utf8").trim().split(/\r?\n/u);
 		if (bare === "true") throw new WsRefusal(`${project} is a bare git repository, which has no files to work on; open a checkout of it instead`);
 		if (inGitDir === "true") throw new WsRefusal(`${project} is inside a git dir; open the work tree instead`);
+		const both = await this.run(project, ["rev-parse", "--show-toplevel", "--absolute-git-dir"]);
+		const pair = both.code === 0 ? both.out.toString("utf8").trim().split(/\r?\n/u) : [];
+		// A failure, or an unexpected shape, repeats the two single calls so the refusal names the one that failed.
+		if (pair.length === 2) return { kind: "tree", toplevel: canonicalize(pair[0]!), gitDir: canonicalize(pair[1]!) };
 		const top = await this.run(project, ["rev-parse", "--show-toplevel"]);
 		const dir = await this.run(project, ["rev-parse", "--absolute-git-dir"]);
 		if (top.code !== 0) throw this.fail(project, top, "rev-parse --show-toplevel");
@@ -120,11 +124,11 @@ export class HostGit {
 		return r.code === 0 ? r.out.toString("utf8").trim() : undefined;
 	}
 
-	/** The commit ids HEAD and every ref point at. */
-	async refIds(project: string): Promise<string[]> {
+	/** The commit ids HEAD and every ref point at. `knownHead` is the caller's own `head()` ("" for none), to skip a second call. */
+	async refIds(project: string, knownHead?: string): Promise<string[]> {
 		const refs = await this.run(project, ["for-each-ref", "--format=%(objectname)"]);
 		if (refs.code !== 0) throw this.fail(project, refs, "for-each-ref");
-		const head = await this.head(project);
+		const head = knownHead === undefined ? await this.head(project) : knownHead === "" ? undefined : knownHead;
 		return [...new Set([...(head === undefined ? [] : [head]), ...refs.out.toString("utf8").split(/\r?\n/u).filter((id) => id !== "")])];
 	}
 

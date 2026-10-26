@@ -110,33 +110,6 @@ export class Cas {
 		return p.id;
 	}
 
-	/**
-	 * Store many objects, reading them one at a time (never in parallel). The bytes of a batch are held in memory; the batch
-	 * is inserted in one transaction at OPEN_BATCH objects, before an object that would take it past BATCH_BYTES raw bytes,
-	 * and at the end. Returns the ids in order.
-	 */
-	async putAll(reads: Iterable<() => Uint8Array | Promise<Uint8Array>>): Promise<string[]> {
-		const ids: string[] = [];
-		let batch: Packed[] = [];
-		let held = 0;
-		const flush = (): void => {
-			if (batch.length > 0) this.tx(() => this.insert(batch));
-			batch = [];
-			held = 0;
-		};
-		for (const read of reads) {
-			const bytes = await read();
-			if (batch.length > 0 && held + bytes.length > BATCH_BYTES) flush();
-			const p = pack(bytes);
-			batch.push(p);
-			held += bytes.length;
-			ids.push(p.id);
-			if (batch.length >= OPEN_BATCH) flush();
-		}
-		flush();
-		return ids;
-	}
-
 	/** The bytes of an object, or undefined when it is not stored. */
 	get(id: string): Buffer | undefined {
 		const row = this.db.prepare("SELECT codec, data FROM objects WHERE id = ?").get(id) as { codec: string; data: Uint8Array } | undefined;

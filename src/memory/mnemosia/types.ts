@@ -41,8 +41,6 @@ export const SCHEMA_VERSION = {
 	runFingerprint: "mnemosia/run-fingerprint@1",
 	/** A run bound to a named policy-registry version rather than to the current one. See `rollback.ts`. */
 	policyPin: "mnemosia/policy-pin@1",
-	/** Spec §22's eight-field change record. See `rollback.ts`. */
-	policyChangePacket: "mnemosia/policy-change-packet@1",
 	/** The Phase 5 reranking activation switch, off by default. See `rerank.ts`. */
 	rerankGate: "mnemosia/rerank-gate@1",
 	/* --- Phase B: situation and intent ------------------------------------------------------- */

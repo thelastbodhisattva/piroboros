@@ -44,7 +44,7 @@ export const LEARN_REQUEST_TIMEOUT_MS = 300_000;
 const MAX_TOKENS = 8_192;
 const RETRY_TOKENS = 12_000;
 /** The busy reply that ends a pass: the pass sleeps through the ones before it. */
-export const MAX_BUSY = 5;
+const MAX_BUSY = 5;
 const LEARNER = "piroboros:learner";
 const NAME = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const WINDOWS_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu;
@@ -292,7 +292,7 @@ export class Learner {
 		return names.has(name) || existsSync(join(this.deps.home, "skills", name));
 	}
 
-	private removeTmp(pass: string): void {
+	removeTmp(pass: string): void {
 		const dir = learnPaths(this.deps.home).proposed;
 		let names: string[];
 		try { names = readdirSync(dir); } catch { return; }
@@ -574,10 +574,6 @@ export class Learner {
 		this.deps.notice(message);
 	}
 
-	cleanTmp(pass: string): void {
-		this.removeTmp(pass);
-	}
-
 	/* --- commands ---------------------------------------------------------------------------------------------- */
 
 	async command(args: readonly string[], ask?: (question: string) => Promise<boolean>): Promise<string> {
@@ -786,10 +782,6 @@ export class LearnLoop {
 		});
 	}
 
-	/** Resolves once a look that starts now has finished. */
-	whenQuiet(): Promise<void> {
-		return this.chain;
-	}
 }
 
 /* --- the task ---------------------------------------------------------------------------------------------------- */
@@ -895,7 +887,7 @@ function makeTask(learner: Learner) {
 				const cp = task.state.checkpoint as Extract<Checkpoint, { phase: "apply" }>;
 				const input = task.input;
 				try {
-					learner.cleanTmp(pass);
+					learner.removeTmp(pass);
 					const done = await learner.apply(pass, cp.reply);
 					const usage = { input: cp.input, output: cp.output };
 					if (done.error !== undefined) return await end(runtime, context, input, { error: done.error, usage, advance: true });
@@ -903,14 +895,14 @@ function makeTask(learner: Learner) {
 					await end(runtime, context, input, { staged: done.staged, refused: done.refused, tombstones: done.tombstones, usage, advance: true, ...(note === undefined ? {} : { note }) });
 				} catch (error) {
 					runtime.signal.throwIfAborted();
-					learner.cleanTmp(pass);
+					learner.removeTmp(pass);
 					await end(runtime, context, input, { error: learner.clean(error instanceof Error ? error.message : String(error)), usage: { input: cp.input, output: cp.output }, advance: true });
 				}
 			},
 		},
 		// Reached by /learn skip on a parked pass: no partial proposal is left, and the next pass starts after this range.
 		abort: async (task, runtime, context) => {
-			learner.cleanTmp(String(runtime.taskId));
+			learner.removeTmp(String(runtime.taskId));
 			await end(runtime, context, task.input, { error: "pass skipped", advance: true });
 		},
 	});

@@ -807,11 +807,6 @@ function qualifierRecord(detector: ConflictDetectorId, conflictClass: ConflictCl
 	};
 }
 
-/** The qualification sentences attached to one claim, in record order. Empty when it is unconflicted. */
-export function qualificationsFor(resolution: ConflictResolution, claimId: string): string[] {
-	return (resolution.byClaimId.get(claimId) ?? []).map((entry) => entry.qualification);
-}
-
 /* ------------------------------------------------------------------------------------------------
  * Presentation (Phase 4)
  * ---------------------------------------------------------------------------------------------- */

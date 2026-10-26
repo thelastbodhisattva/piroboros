@@ -8,7 +8,7 @@ import { ConflictFound, HoldError, realFs, Writer, type Fs, type Row } from "./a
 import { confineFor, nativeDeps, type Confine, type ConfineDeps, type Found } from "./confine.ts";
 import { dockerRemove, dockerSweep, type DockerConf } from "./docker.ts";
 import { wslRemove, wslSweep, type Remote, type WslPlan } from "./wsl.ts";
-import { BATCH_BYTES, Cas, GC_GRACE, OPEN_BATCH, pack, SNAPSHOT_MAX, type Packed } from "./cas.ts";
+import { BATCH_BYTES, Cas, OPEN_BATCH, pack, SNAPSHOT_MAX, type Packed } from "./cas.ts";
 import { HostGit, WsRefusal, type GitSpy, type GitState } from "./git.ts";
 import { lwwMatch, lwwRules, type LwwRule } from "./lww.ts";
 import { decide, hasBlock, TEXT_MAX, type ConflictKind, type Side } from "./merge.ts";
@@ -76,9 +76,6 @@ interface Plan {
 	ignoreFailed: boolean;
 	/** `.lww` decisions: the rule and the side kept. */
 	lww: { path: string; rule: string; kept: "ours" | "theirs" }[];
-	/** Paths whose marker block was resolved: the next merge three-way merges them against the recorded live text. */
-	rebased: Set<string>;
-	changed: number;
 	redecide(row: Row, live: Buffer | null): Promise<"drop" | "conflict" | "oversize" | { row: Row }>;
 }
 /** What a `/conclave merge` prompt showed; the merge after the answer goes ahead only when its new plan shows the same. */
@@ -129,7 +126,6 @@ export class Workspaces {
 	private readonly queued = new Set<number>();
 	/** Workspaces whose confinement backend was found unavailable in this run, with the reason: no command spawns, and the run ends held with code `backend`. */
 	private readonly down = new Map<number, string>();
-	private readonly ignored = new Map<number, string[]>();
 	private readonly chainKeys = new Map<string, string>();
 	taskStatus: WsOptions["taskStatus"];
 
@@ -164,7 +160,6 @@ export class Workspaces {
 	byKey(key: string): WsRow | undefined { return this.rows("key = ?", key)[0]; }
 	/** The newest Workspace of a project that is still in play. */
 	forProject(project: string): WsRow | undefined { return this.rows("project = ? AND state IN ('open', 'held', 'conflicted')", canonicalize(project))[0]; }
-	forConv(conv: number): WsRow | undefined { return this.byConv.get(conv); }
 
 	private set(id: number, patch: Partial<Pick<WsRow, "state" | "hold" | "hold_detail" | "key" | "conv" | "head">>): void {
 		const entries = Object.entries(patch);
@@ -440,7 +435,7 @@ export class Workspaces {
 				} catch { ents.set(e.path, { ...e, hash: null, object: null, kind: "skipped" }); skipped.push(`${e.path} (it vanished during the copy)`); }
 			});
 			const head = state.kind === "tree" ? (await this.git.head(project)) ?? "" : null;
-			const refs = mode === "git" && state.kind === "tree" ? await this.git.refIds(project) : [];
+			const refs = mode === "git" && state.kind === "tree" ? await this.git.refIds(project, head ?? "") : [];
 			if (refs.length > 0 && (await this.git.missingObjects(project, refs)).length > 0) refuse("the live repository is missing objects that its own refs name; run git fsck there first");
 			const objectIds = [...ents.values()].flatMap((e) => (e.object === null ? [] : [e.object]));
 			const places = [...new Set([...links, "node_modules"])];
@@ -552,9 +547,7 @@ export class Workspaces {
 	private baseOf(ws: number): Map<string, Ent> { return this.manifest(ws, "'base', 'refresh'"); }
 
 	/** The paths Vesperia changed since the base. */
-	private changedPaths(ws: number): string[] {
-		const head = this.headOf(ws);
-		const base = this.baseOf(ws);
+	private changedPaths(ws: number, head = this.headOf(ws), base = this.baseOf(ws)): string[] {
 		return [...new Set([...head.keys(), ...base.keys()])].filter((p) => (head.get(p)?.hash ?? null) !== (base.get(p)?.hash ?? null) || (head.get(p)?.kind ?? null) !== (base.get(p)?.kind ?? null)).sort();
 	}
 
@@ -595,7 +588,7 @@ export class Workspaces {
 			const known = stat.get(path);
 			const mtime = Math.floor(info.mtimeMs);
 			if (known !== undefined && !force && known.size === info.size && known.mtime === mtime) return;
-			const hash = link ? sha(await this.fs.readlink(join(row.folder, path)).catch(() => "")) : await this.writer.hashFile(join(row.folder, path));
+			const hash = link ? sha(await this.fs.readlink(join(row.folder, path)).catch(() => "")) : await this.writer.hashFile(join(row.folder, path), info.size);
 			if (known === undefined) fresh.push({ path, hash, size: info.size, mtime, link });
 			else if (known.hash === hash) touch.push({ path, size: info.size, mtime, hash });
 			else changed.push({ path, hash, size: info.size, mtime, link });
@@ -611,7 +604,6 @@ export class Workspaces {
 				adds = adds.filter((a) => !hit.has(a.path));
 			} catch (error) { ignoreFailed = true; this.o.notice(`the live ignore rules could not be read (${msg(error)}); the merge will hold`); }
 		}
-		if (only === undefined) this.ignored.set(row.id, ignoredNew);
 		await this.checkpoint(row, [...changed, ...adds], deleted, touch);
 		return { ignoredNew, ignoreFailed };
 	}
@@ -629,7 +621,8 @@ export class Workspaces {
 				const entry = this.cas.db.prepare('INSERT INTO entries("commit", path, object, hash, size, kind) VALUES (?, ?, ?, ?, ?, ?)');
 				const stat = this.cas.db.prepare("INSERT INTO ws_stat VALUES (?, ?, ?, ?, ?) ON CONFLICT(workspace, path) DO UPDATE SET size = excluded.size, mtime = excluded.mtime, hash = excluded.hash");
 				for (const b of list) { entry.run(id, b.c.path, b.p?.id ?? null, b.c.hash, b.c.size, b.c.link ? "link" : "file"); stat.run(row.id, b.c.path, b.c.size, b.c.mtime, b.c.hash); }
-				for (const path of gone) { entry.run(id, path, null, null, 0, "file"); this.cas.db.prepare("DELETE FROM ws_stat WHERE workspace = ? AND path = ?").run(row.id, path); }
+				const unstat = this.cas.db.prepare("DELETE FROM ws_stat WHERE workspace = ? AND path = ?");
+				for (const path of gone) { entry.run(id, path, null, null, 0, "file"); unstat.run(row.id, path); }
 				this.cas.db.prepare("UPDATE workspaces SET head = ? WHERE id = ?").run(id, row.id);
 			});
 		};
@@ -717,7 +710,7 @@ export class Workspaces {
 		if (!info.isFile()) return { kind: "link" };
 		const mtime = Math.floor(info.mtimeMs);
 		if (info.size <= TEXT_MAX) { const bytes = await this.fs.readFile(abs); return { kind: "file", hash: sha(bytes), size: bytes.length, mtime, bytes }; }
-		return { kind: "file", hash: await this.writer.hashFile(abs), size: info.size, mtime };
+		return { kind: "file", hash: await this.writer.hashFile(abs, info.size), size: info.size, mtime };
 	}
 
 	private big(n: number): Uint8Array { return new Uint8Array(TEXT_MAX + 1).fill(n); }
@@ -748,7 +741,7 @@ export class Workspaces {
 		const conflicts: PlanConflict[] = [];
 		const left: Plan["left"] = [];
 		const oversize: Plan["oversize"] = [];
-		const paths = this.changedPaths(row.id);
+		const paths = this.changedPaths(row.id, head, base);
 		const label = `workspace ${row.id}`;
 		const rules = this.lwwFor(row.project);
 		const lww: Plan["lww"] = [];
@@ -757,7 +750,7 @@ export class Workspaces {
 		const entryOf = (p: string): Ent | undefined => { const e = head.get(p); return e === undefined || e.hash === null ? undefined : e; };
 		const baseEnt = (p: string): Ent | undefined => { const e = base.get(p); return e === undefined || e.hash === null ? undefined : e; };
 		const wsAbs = (p: string): string => join(row.folder, ...p.split("/"));
-		const items = new Map<string, { ours: Ent | undefined; base: Ent | undefined; abs: string; over?: Buffer }>();
+		const items = new Map<string, { ours: Ent | undefined; base: Ent | undefined; over?: Buffer }>();
 		const sideOf = async (e: Ent | undefined, n: number, source: "ws" | "base", path: string): Promise<Side> => {
 			if (e === undefined) return undefined;
 			if (e.size > TEXT_MAX) return this.big(n);
@@ -802,8 +795,6 @@ export class Workspaces {
 			}
 		}
 		const renamed = new Set(renames.values());
-		const created = new Map<string, number>();
-		const live = new Map<string, Awaited<ReturnType<Workspaces["liveInfo"]>>>();
 		const mkdirs = new Set<string>();
 		const dirFor = async (rel: string): Promise<string | undefined> => {
 			// A parent that is a live file is a type conflict; a missing parent is made by a mkdir row.
@@ -822,7 +813,7 @@ export class Workspaces {
 			conflicts.push({ path, kind, ours: null, oursSize: ours?.size ?? 0, theirsHash: theirs?.hash ?? null, theirs: theirs?.bytes ?? null, liveSize: theirs?.size ?? 0, wsPath: wsAbs(path), ...(marked === undefined ? {} : marked) });
 		};
 		const makeRow = (path: string, from: string | null, op: Row["op"], pre: string | null, post: string | null, extra: Partial<Row> = {}): Row => ({ seq: 0, path, from, op, pre, post, mode: null, ...extra });
-		const decideFor = async (path: string, entry: Ent | undefined, b: Ent | undefined, theirs: Awaited<ReturnType<Workspaces["liveInfo"]>>, abs: string, over?: Buffer): Promise<Row | "skip" | "oversize" | "conflict"> => {
+		const decideFor = async (path: string, entry: Ent | undefined, b: Ent | undefined, theirs: Awaited<ReturnType<Workspaces["liveInfo"]>>, over?: Buffer): Promise<Row | "skip" | "oversize" | "conflict"> => {
 			const ours: Ent | undefined = over === undefined ? entry : { path, hash: sha(over), object: null, size: over.length, kind: "file" };
 			const theirHash = theirs.kind === "file" ? theirs.hash : null;
 			const theirSize = theirs.kind === "file" ? theirs.size : 0;
@@ -842,7 +833,6 @@ export class Workspaces {
 			const times = rule === null ? undefined : { rules, ours: this.oursTime(row.id, path, ours !== undefined), theirs: theirs.kind === "file" ? theirs.mtime : -Infinity };
 			const d = decide(path, await sideOf(b, 3, "base", path), over ?? await sideOf(ours, 1, "ws", path), theirs.kind === "file" ? (theirs.bytes ?? this.big(2)) : undefined, { labels: [label, `live ${row.id}`], ...(times === undefined ? {} : { lww: times }) });
 			if ("lww" in d && d.lww !== undefined) lww.push({ path, ...d.lww });
-			void abs;
 			if (d.op === "skip") return "skip";
 			if (d.op === "ours") return takeOurs();
 			if (d.op === "merged") {
@@ -858,25 +848,24 @@ export class Workspaces {
 			if (renamed.has(t.path) || processed.has(t.path)) continue;
 			const abs = await this.writer.name(row.project, t.path, caseless);
 			const theirs = await this.liveInfo(abs);
-			live.set(t.path, theirs);
-			items.set(t.path, { ours: t.ours, base: t.base, abs, ...(t.over === undefined ? {} : { over: t.over }) });
+			items.set(t.path, { ours: t.ours, base: t.base, ...(t.over === undefined ? {} : { over: t.over }) });
 			// A new path equal under case folding to a different live path is a case conflict.
 			if (caseless && t.ours !== undefined && t.base === undefined && !renames.has(t.path) && theirs.kind !== "absent" && relative(row.project, abs).replaceAll("\\", "/") !== t.path) { conflict(t.path, "case", t.ours, { hash: theirs.kind === "file" ? theirs.hash : null, size: 0 }); continue; }
-			const outcome = await decideFor(t.path, t.ours, t.base, theirs, abs, t.over);
-			if (typeof outcome !== "string") { rows.push(outcome); if (outcome.op !== "delete") created.set(t.path, rows.length - 1); }
+			const outcome = await decideFor(t.path, t.ours, t.base, theirs, t.over);
+			if (typeof outcome !== "string") rows.push(outcome);
 		}
 		for (const [bPath, aPath] of renames) {
 			const a = todo.find((t) => t.path === aPath)!;
 			const b = todo.find((t) => t.path === bPath)!;
 			const absA = await this.writer.name(row.project, aPath, caseless);
 			const theirs = await this.liveInfo(absA);
-			items.set(bPath, { ours: b.ours, base: b.base, abs: absA });
+			items.set(bPath, { ours: b.ours, base: b.base });
 			if (theirs.kind === "file" && theirs.hash === a.base!.hash) {
 				if (theirs.size > SNAPSHOT_MAX) { oversize.push({ path: aPath, ws: join(row.folder, ...bPath.split("/")) }); continue; }
 				rows.push(makeRow(bPath, aPath, "rename", theirs.hash, b.ours!.hash, { mode: null, preSize: theirs.size, postSize: b.ours!.size }));
 			} else if (theirs.kind === "absent") {
 				// A is gone live: B is a new file there.
-				const out = await decideFor(bPath, b.ours, undefined, await this.liveInfo(await this.writer.name(row.project, bPath, caseless)), absA);
+				const out = await decideFor(bPath, b.ours, undefined, await this.liveInfo(await this.writer.name(row.project, bPath, caseless)));
 				if (typeof out !== "string") rows.push(out);
 			} else conflict(bPath, "case", b.ours, { hash: theirs.kind === "file" ? theirs.hash : null, size: 0 });
 		}
@@ -890,13 +879,13 @@ export class Workspaces {
 			if (e !== undefined) c.ours = items.get(c.path)?.over ?? await this.fs.readFile(wsAbs(c.path)).catch(() => null);
 		}
 		const plan: Plan = {
-			rows: ordered, conflicts, left, oversize, deletes: ordered.filter((r) => r.op === "delete").length, ignored: scan.ignoredNew, ignoreFailed: scan.ignoreFailed, lww, rebased, changed: paths.length,
+			rows: ordered, conflicts, left, oversize, deletes: ordered.filter((r) => r.op === "delete").length, ignored: scan.ignoredNew, ignoreFailed: scan.ignoreFailed, lww,
 			redecide: async (r, bytes) => {
 				const item = items.get(r.path);
 				if (item === undefined || r.op === "rename" || r.op === "mkdir") return "conflict";
 				const theirs = bytes === null ? { kind: "absent" as const } : { kind: "file" as const, hash: sha(bytes), size: bytes.length, mtime: this.now(), bytes };
 				const before = conflicts.length;
-				const out = await decideFor(r.path, item.ours, item.base, theirs, item.abs, item.over);
+				const out = await decideFor(r.path, item.ours, item.base, theirs, item.over);
 				if (conflicts.length > before) { conflicts.pop(); return "conflict"; }
 				if (out === "oversize") return "oversize";
 				if (typeof out === "string") return "drop";
@@ -995,7 +984,7 @@ export class Workspaces {
 	 * The merge of the `run` phase, by the replay table: W is the Workspace with this run key, R its newest merge record for
 	 * the key. Only an `open` Workspace with no record merges, and only on a `done` verdict. Nothing here asks the user.
 	 */
-	async settle(key: string, verdict: string, failure?: string, backend?: string): Promise<{ text: string; merge: ExecMerge }> {
+	async settle(key: string, verdict: string, failure?: string): Promise<{ text: string; merge: ExecMerge }> {
 		const w = this.byKey(key);
 		if (w === undefined) return { text: "the Workspace record for this run is missing; nothing was merged", merge: { state: "held" } };
 		return this.chained(w.project, async () => {
@@ -1008,7 +997,7 @@ export class Workspaces {
 			}
 			if (row.state === "open" && r === undefined) {
 				if (verdict !== "done") { this.hold(row.id, "verdict", failure ?? (verdict === "unknown" ? "without a verdict" : verdict)); return out(holdText("verdict", failure ?? (verdict === "unknown" ? "without a verdict" : verdict))); }
-				const down = backend ?? this.down.get(row.id);
+				const down = this.down.get(row.id);
 				if (down !== undefined) { this.hold(row.id, "backend", down); return out(holdText("backend", down)); }
 				const result = await this.mergeNow(row, key);
 				return { text: result.text, merge: { state: result.state, ...(result.record === undefined ? {} : { record: result.record }), ...(result.code === undefined ? {} : { code: result.code }) } };
@@ -1206,7 +1195,7 @@ export class Workspaces {
 		if (row.state === "open") return { text: "", verdict: "failed", merge };
 		if (w.state === "held" || w.state === "conflicted") return { text: `Vesperia's run was cancelled; its Workspace stays ${w.state}: ${w.state === "conflicted" ? holdText("conflicts", w.hold_detail) : holdText(w.hold, w.hold_detail)}`, verdict: "failed", merge };
 		if (w.state === "merged" && r !== undefined && r.state === "done") return { text: `Vesperia's run was cancelled after its merge: ${r.summary}`, verdict: "done", merge };
-		if (w.state === "merged") return { text: `ended after /conclave merge: ${this.cas.db.prepare("SELECT summary FROM merges WHERE workspace = ? ORDER BY id DESC LIMIT 1").get(w.id) === undefined ? "nothing was merged" : (this.cas.db.prepare("SELECT summary FROM merges WHERE workspace = ? ORDER BY id DESC LIMIT 1").get(w.id) as { summary: string }).summary}`, verdict: "failed", merge };
+		if (w.state === "merged") return { text: `ended after /conclave merge: ${(this.cas.db.prepare("SELECT summary FROM merges WHERE workspace = ? ORDER BY id DESC LIMIT 1").get(w.id) as { summary: string } | undefined)?.summary ?? "nothing was merged"}`, verdict: "failed", merge };
 		return { text: w.hold_detail === "nothing left to merge" ? "ended after /conclave merge, which had nothing left to merge" : "ended after /conclave discard", verdict: "failed", merge };
 	}
 
