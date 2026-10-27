@@ -2,6 +2,25 @@
 
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.3] - 2026-10-28
+
+### Security
+
+- A Workspace with git is now its own repository. At open piroboros makes a new one in the Workspace folder with one commit of the copied files, on the branch name your repository is on, with your remotes' addresses and a push address that fails. Nothing of your `.git` comes along: no history, branches, stashes, index or objects, and nothing is bound or mounted into the sandbox. Before, a secret that was excluded from the copy (a `.env` committed once and deleted since) could still be read from your object store through the shared objects. This removes the object-folder code added in 0.3.1, including the unchecked Docker mount of alternates.
+- The visible change: `git log` in a Workspace shows one commit, and a Workspace made by 0.3.2 or earlier loses its git history when it is reopened, or when its run is resumed after a retry or a restart (its files stay, and one notice line says so). A Docker or WSL sandbox of such a Workspace, which still binds your objects, is made again before the run's first command, as a reopen does (a Docker container is removed and a new one started), and the run goes on. If the new sandbox cannot be made, the run ends held with the reason `confinement backend unavailable`, and approving it again reopens the Workspace.
+- The base commit of a Workspace is built with `git fast-import` and `git read-tree`, which run no clean filter, line-ending conversion or hook, so no filter in your global or system git config (a `filter.lfs.*` entry, for example) runs on your machine at open. Each file's blob holds its bytes as copied. A project of 24,000 unique files opens in about 17 seconds instead of 72, because no loose object is written per file. With `core.autocrlf` and `* text=auto` the Workspace's `git status` stays clean; a file with an explicit `text` or `eol` attribute whose line endings differ from it, or a file a clean filter changes, can show as modified in `git status` inside the Workspace before Vesperia touches it. Merges read no git, so they are not affected.
+- `id_dsa` is now refused by the file tools and left out of a Workspace like the other SSH private key names (`id_rsa`, `id_ecdsa`, `id_ed25519`).
+- Everything piroboros writes into a Workspace after Vesperia has had it (the refresh when a held Workspace reopens, the empty `node_modules` folders on WSL and the conflict markers) now checks every folder on the way for a link and writes through a new file that is renamed over the old one. Before, she could replace a folder or the `.git/objects/info/alternates` file with a link to a file outside the Workspace and have piroboros overwrite that file. A refused path is skipped with a notice. With Docker, every process in the container is ended before the host reads or writes the Workspace, so a background process cannot race it.
+- The bubblewrap sandbox (native and in WSL) no longer starts from a read-only view of the whole root. A command sees only `/usr`, `/etc`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32` and `/nix` where they exist, the PATH folders outside them, the Workspace, and empty `/tmp`, `/var/tmp` and home folders; `/opt`, `/srv`, `/var`, `/mnt`, `/media`, other drives and a project outside your home are gone, and your live project is empty wherever it is. Before, with `workspace.network` on (the default), a command could read and send any of them. A stored WSL sandbox from 0.3.2 or earlier is made again before its next command.
+- With `workspace.network` on, the sandbox shares the network namespace and with it the abstract Unix sockets, which is documented as a residual and not closed: a Linux desktop's X server usually listens on one (set `workspace.network` to `false` there), and in WSL they are systemd's system buses, which a normal shell reaches too.
+- A path under a `guard.deny` folder inside the project is no longer copied into a Workspace, at open or at a refresh.
+- `/conclave undo` and the recovery after a crash now apply the checks a merge applies: a link or a non-folder on the way to a path, a path that resolves outside the project, or the guard. A row that fails them is reported as protected and its path is not touched; the clean-up of leftover files skips such a folder. Before, replacing a folder with a link to a folder holding the same bytes made an undo delete or replace the files there.
+
+### Fixed
+
+- A folder in the Workspace that cannot be read is no longer taken for a deletion of everything in it. The merge holds with the folder named, and `/conclave merge` continues once the permissions are fixed. Checkpoints during the run are not affected.
+- A `node_modules` folder that git tracks is left out of the copy like any other, so a merge no longer deletes its files from your project. A merge row under a `node_modules` folder is never applied.
+
 ## [0.3.2] - 2026-10-27
 
 ### Changed

@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
+import { constants, existsSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { checkPath, checkRead, WIDE_SECRET, type GuardConfig } from "../guard.ts";
+import { checkPath, checkRead, denyRoots, WIDE_SECRET, type GuardConfig } from "../guard.ts";
 import { canonicalize, isInside, samePath } from "../paths.ts";
 import { ConflictFound, HoldError, realFs, Writer, type Fs, type Row } from "./apply.ts";
-import { confineFor, nativeDeps, type Confine, type ConfineDeps, type Found } from "./confine.ts";
-import { dockerRemove, dockerSweep, type DockerConf } from "./docker.ts";
+import { needsRepick, confineFor, nativeDeps, type Confine, type ConfineDeps, type Found } from "./confine.ts";
+import { dockerKill, dockerRemove, dockerSweep, type DockerConf } from "./docker.ts";
 import { wslRemove, wslSweep, type Remote, type WslPlan } from "./wsl.ts";
 import { BATCH_BYTES, Cas, OPEN_BATCH, pack, SNAPSHOT_MAX, type Packed } from "./cas.ts";
 import { HostGit, WsRefusal, type GitSpy, type GitState } from "./git.ts";
@@ -74,6 +74,8 @@ interface Plan {
 	deletes: number;
 	ignored: string[];
 	ignoreFailed: boolean;
+	/** Workspace folders the scan could not list: the merge holds until they can be. */
+	unreadable: string[];
 	/** `.lww` decisions: the rule and the side kept. */
 	lww: { path: string; rule: string; kept: "ours" | "theirs" }[];
 	redecide(row: Row, live: Buffer | null): Promise<"drop" | "conflict" | "oversize" | { row: Row }>;
@@ -100,6 +102,7 @@ export function holdText(code: string | null, detail: string | null): string {
 		case "rollback": return `merge ${d} was rolled back`;
 		case "backend": return `confinement backend unavailable: ${d}`;
 		case "ignore-rules": return "the live ignore rules could not be read";
+		case "unreadable": return `folders in the Workspace could not be read (${d.split("\n").join(", ")}), so what they hold cannot be merged or told deleted; fix their permissions, then /conclave merge`;
 		case "target-moved": return "the project folder is not the one the Workspace was opened for";
 		case "folder-missing": return "the Workspace folder is missing";
 		case "not-recovered": return `merge record ${d} was not recovered`;
@@ -110,6 +113,64 @@ export function holdText(code: string | null, detail: string | null): string {
 }
 
 const LIMITED = (items: string[], max = 20): string[] => (items.length > max ? [...items.slice(0, max), `and ${items.length - max} more`] : items);
+
+/**
+ * Host access below a Workspace folder after Vesperia has had it: she can replace any folder in it with a link. Every component
+ * from the folder down to the parent of the leaf is lstat-ed and must be a real folder (`make` creates a missing one), and a
+ * leaf that exists must be a regular file. A write goes to a new name in the same folder and is renamed over the leaf, which
+ * replaces a link and never follows it; a delete unlinks the leaf only. A link or a non-folder refuses with a WsRefusal.
+ */
+async function wsDir(fs: Fs, folder: string, parts: string[], make: boolean): Promise<string> {
+	let cur = folder;
+	for (const part of parts) {
+		cur = join(cur, part);
+		let info = await fs.lstat(cur).catch((error: unknown) => { if (make && code(error) === "ENOENT") return undefined; throw error; });
+		if (info === undefined) { await fs.mkdir(cur); info = await fs.lstat(cur); }
+		if (!info.isDirectory()) throw new WsRefusal(`${cur} in the Workspace is a link or not a folder`);
+	}
+	return cur;
+}
+
+/**
+ * `refused(rel)`: whether the guard refuses reading `rel` under `project` (nested guard.deny, a credential folder inside a guard.allow folder). A checkRead costs about
+ * 0.8 ms, which was 20 s over 24,000 files, and below a folder the verdict does not depend on the file name (secret names are filtered before this), so it is asked once
+ * per folder. Under a deny root that lies inside the project, and when a root cannot be evaluated, each path is asked itself.
+ */
+function readRefuser(project: string, cfg: GuardConfig): (rel: string) => boolean {
+	const inner: string[] = [];
+	let each = false;
+	for (const root of denyRoots(cfg)) { try { const c = canonicalize(root); if (isInside(project, c)) inner.push(c); } catch { each = true; } }
+	const folders = new Map<string, boolean>();
+	return (rel) => {
+		const abs = join(project, ...rel.split("/"));
+		if (each || inner.some((r) => isInside(r, abs))) return !checkRead(abs, undefined, cfg).allowed;
+		const dir = dirname(abs);
+		let allowed = folders.get(dir);
+		if (allowed === undefined) { allowed = checkRead(join(dir, ".piroboros-folder"), undefined, cfg).allowed; folders.set(dir, allowed); }
+		return !allowed;
+	};
+}
+
+let putSeq = 0;
+async function wsPut(fs: Fs, folder: string, rel: string, src: { bytes: Buffer | string } | { file: string }): Promise<void> {
+	const parts = rel.split("/");
+	const dir = await wsDir(fs, folder, parts.slice(0, -1), false);
+	const leaf = join(dir, parts.at(-1)!);
+	const old = await fs.lstat(leaf).catch(() => undefined);
+	if (old !== undefined && !old.isFile()) throw new WsRefusal(`${leaf} in the Workspace is a link or not a regular file`);
+	const tmp = join(dir, `.${parts.at(-1)}.piroboros-new-${process.pid}-${++putSeq}`);
+	try {
+		if ("file" in src) await fs.copyFile(src.file, tmp, constants.COPYFILE_EXCL);
+		else { const fh = await fs.open(tmp, "wx", (old?.mode ?? 0o644) & 0o777); try { await fh.writeFile(src.bytes); } finally { await fh.close(); } }
+		await fs.rename(tmp, leaf);
+	} catch (error) { await fs.unlink(tmp).catch(() => undefined); throw error; }
+}
+
+/** Whether a file was removed (false: it or a parent was not there). */
+async function wsUnlink(fs: Fs, folder: string, rel: string): Promise<boolean> {
+	const parts = rel.split("/");
+	try { await fs.unlink(join(await wsDir(fs, folder, parts.slice(0, -1), false), parts.at(-1)!)); return true; } catch (error) { if (code(error) === "ENOENT") return false; throw error; }
+}
 
 export class Workspaces {
 	readonly cas: Cas;
@@ -126,6 +187,7 @@ export class Workspaces {
 	private readonly queued = new Set<number>();
 	/** Workspaces whose confinement backend was found unavailable in this run, with the reason: no command spawns, and the run ends held with code `backend`. */
 	private readonly down = new Map<number, string>();
+	private readonly upgrades = new Map<number, Promise<void>>();
 	private readonly chainKeys = new Map<string, string>();
 	taskStatus: WsOptions["taskStatus"];
 
@@ -277,24 +339,19 @@ export class Workspaces {
 			if (same !== undefined) {
 				if (same.state === "open") throw new WsRefusal("Vesperia is already working on this project in another conversation; wait for that run or /conclave cancel it there");
 				if (same.plan !== plan) throw new WsRefusal(`Vesperia's earlier Workspace holds ${this.changedPaths(same.id).length} changed files; /conclave merge or /conclave discard first.`);
-				const refs = same.refs === null ? [] : (JSON.parse(same.refs) as string[]);
-				if (same.mode === "git" && refs.length > 0 && (await this.git.missingObjects(project, refs)).length > 0) {
-					throw new WsRefusal(`the live repository no longer has objects this Workspace's git needs (pruned since ${new Date(same.created).toISOString().slice(0, 10)}); its files are intact: /conclave merge or /conclave discard still work.`);
-				}
 				const earlier = JSON.parse(same.confine) as Confine;
+				await this.quiet(same);
 				const prior = earlier.wsl ?? earlier.docker;
-				// The object folders come from the live repository, never from the Workspace's own alternates file (Vesperia can write it). If the live repository cannot be read, the stored list stands.
-				const live = same.mode === "git" ? await this.git.state(project).catch(() => undefined) : undefined;
-				const alt = same.mode !== "git" ? [] : live?.kind === "tree" ? await this.altLines(live.gitDir) : prior?.alt ?? earlier.alt ?? [];
 				const places = prior?.places ?? ["node_modules"];
-				const picked = await this.pick(same.folder, { places, alt, project, files: 0, prev: earlier.wsl, prevDocker: earlier.docker });
-				if (onWsl(picked.confine)) for (const place of places) await this.fs.mkdir(join(same.folder, place), { recursive: true } as never);
-				if (same.mode === "git") await this.fs.writeFile(join(same.folder, ".git", "objects", "info", "alternates"), `${(picked.alt ?? alt).join("\n")}\n`);
+				const picked = await this.pick(same.folder, { places, project, files: 0, prev: earlier.wsl, prevDocker: earlier.docker });
+				if (onWsl(picked.confine)) for (const place of places) await wsDir(this.fs, same.folder, place.split("/"), true);
+				// A Workspace of 0.3.2 or earlier borrowed the live repository's objects through this file. It goes (the leaf only, through no link), and no object folder is bound or mounted any more.
+				const history = same.mode === "git" ? await wsUnlink(this.fs, same.folder, ".git/objects/info/alternates").catch((error: unknown) => { this.o.notice(`the Workspace's git alternates file could not be removed (${msg(error)})`); return false; }) : false;
 				this.down.delete(same.id);
 				const refreshed = await this.refreshLive(same).catch((error: unknown) => { this.o.notice(`the earlier Workspace could not be refreshed from ${project} (${msg(error)})`); return 0; });
 				this.cas.tx(() => { this.cas.db.prepare("UPDATE workspaces SET key = ?, conv = NULL, state = 'open', hold = NULL, hold_detail = NULL, confine = ? WHERE id = ?").run(key, JSON.stringify(picked.confine), same.id); });
 				if (same.conv !== null) this.byConv.delete(same.conv);
-				return { folder: same.folder, notice: [`Vesperia continues in her earlier Workspace of ${project} (${this.changedPaths(same.id).length} changed files${refreshed > 0 ? `; ${refreshed} you changed in your folder were refreshed` : ""})`, `Shell confinement: ${picked.label}.`, ...picked.notice] };
+				return { folder: same.folder, notice: [`Vesperia continues in her earlier Workspace of ${project} (${this.changedPaths(same.id).length} changed files${refreshed > 0 ? `; ${refreshed} you changed in your folder were refreshed` : ""})`, `Shell confinement: ${picked.label}.`, ...picked.notice, ...(history ? ["Git history is no longer available in this Workspace; its files are unchanged."] : [])] };
 			}
 			return this.copyIn(key, mode, project, plan);
 		});
@@ -310,14 +367,21 @@ export class Workspaces {
 		const changed: { path: string; hash: string; size: number; mtime: number; link: boolean }[] = [];
 		const deleted: string[] = [];
 		const wsPath = (p: string): string => join(row.folder, ...p.split("/"));
-		const todo = [...this.baseOf(row.id)].filter(([p, b]) => b.kind === "file" && b.hash !== null && head.get(p)?.hash === b.hash);
+		const denied = readRefuser(row.project, this.o.guard());
+		const todo = [...this.baseOf(row.id)].filter(([p, b]) => b.kind === "file" && b.hash !== null && head.get(p)?.hash === b.hash && !p.split("/").some((part) => LINK_NAMES.includes(part)));
+		const refused: string[] = [];
 		await this.pool(todo, 16, async ([p, b]) => {
-			const live = await this.liveInfo(await this.writer.name(row.project, p, row.live_caseless === 1));
-			if (live.kind === "absent") { await this.fs.unlink(wsPath(p)).catch(() => undefined); deleted.push(p); return; }
-			if (live.kind !== "file" || live.hash === b.hash) return;
-			if (live.bytes !== undefined) await this.fs.writeFile(wsPath(p), live.bytes); else await this.fs.copyFile(join(row.project, ...p.split("/")), wsPath(p));
-			changed.push({ path: p, hash: live.hash, size: live.size, mtime: Math.floor((await this.fs.lstat(wsPath(p))).mtimeMs), link: false });
+			// Every write below goes through the link-safe helpers: Vesperia may have replaced a folder of the Workspace with a link. A path refused there is skipped.
+			try {
+				const live = await this.liveInfo(await this.writer.name(row.project, p, row.live_caseless === 1));
+				if (live.kind === "absent") { await wsUnlink(this.fs, row.folder, p).catch((error: unknown) => { if (error instanceof WsRefusal) throw error; }); deleted.push(p); return; }
+				if (live.kind !== "file" || live.hash === b.hash) return;
+				if (denied(p)) return;
+				await wsPut(this.fs, row.folder, p, live.bytes !== undefined ? { bytes: live.bytes } : { file: join(row.project, ...p.split("/")) });
+				changed.push({ path: p, hash: live.hash, size: live.size, mtime: Math.floor((await this.fs.lstat(wsPath(p))).mtimeMs), link: false });
+			} catch (error) { if (!(error instanceof WsRefusal)) throw error; refused.push(msg(error)); }
 		});
+		if (refused.length > 0) this.o.notice(`the refresh skipped ${refused.length} path${refused.length === 1 ? "" : "s"} of the Workspace: ${LIMITED(refused, 3).join("; ")}`);
 		await this.checkpoint(row, changed, deleted, [], "refresh");
 		return changed.length + deleted.length;
 	}
@@ -351,8 +415,12 @@ export class Workspaces {
 		const dev = (await this.fs.lstat(project, { bigint: true } as never)) as unknown as { dev: bigint; ino: bigint };
 		const items: { path: string; size: number; mode: number; link?: string }[] = [];
 		const missing: string[] = [];
+		const denied = readRefuser(project, cfg);
 		await this.pool(listed, 16, async (path) => {
 			if (WIDE_SECRET.some((p) => p.test(basename(path)))) { secrets.push(path); return; }
+			// A path with a node_modules component starts empty (the scan never looks there, so a copied file would read as deleted); a path guard.deny holds stays out.
+			if (path.split("/").some((part) => LINK_NAMES.includes(part))) { skipped.push(`${path} (inside a folder that starts empty)`); return; }
+			if (denied(path)) { skipped.push(`${path} (protected)`); return; }
 			try {
 				const info = await this.fs.lstat(join(project, path));
 				if (info.isDirectory()) { skipped.push(`${path} (a folder: a nested repository or an uninitialized submodule)`); return; }
@@ -379,9 +447,8 @@ export class Workspaces {
 		}
 		let chosen: Confine | undefined;
 		try {
-			const gitFiles = mode === "git" && state.kind === "tree" ? await this.gitAllowList(state.gitDir) : [];
-			const total = items.length + gitFiles.length;
-			const bytes = items.reduce((n, i) => n + i.size, 0) + gitFiles.reduce((n, g) => n + g.size, 0);
+			const total = items.length;
+			const bytes = items.reduce((n, i) => n + i.size, 0);
 			if (total > FILE_BOUND) refuse(`${project} has ${total} files to copy, over the limit of ${FILE_BOUND}; set workspace.enabled to false to run in place`);
 			if (bytes > BYTE_BOUND) refuse(`${project} has ${bytes} bytes to copy, over the limit of 2 GiB; set workspace.enabled to false to run in place`);
 			if (state.kind === "tree") {
@@ -423,8 +490,6 @@ export class Workspaces {
 			for (const path of missing) ents.set(path, { path, hash: null, object: null, size: 0, kind: "skipped" });
 			// LINK_NAMES folders (node_modules) start as empty real folders: no link into the live project, ever.
 			for (const rel of links) await ensure(join(folder, rel));
-			if (mode === "git" && state.kind === "tree") await this.copyGit(state.gitDir, folder, gitFiles);
-			const alt = mode === "git" && state.kind === "tree" ? await this.altLines(state.gitDir) : [];
 			// Stat every copied path: a path missing or of another size after the copy becomes `skipped`.
 			const stats = new Map<string, { size: number; mtime: number }>();
 			await this.pool([...ents.values()].filter((e) => e.kind !== "skipped"), 16, async (e) => {
@@ -435,21 +500,25 @@ export class Workspaces {
 				} catch { ents.set(e.path, { ...e, hash: null, object: null, kind: "skipped" }); skipped.push(`${e.path} (it vanished during the copy)`); }
 			});
 			const head = state.kind === "tree" ? (await this.git.head(project)) ?? "" : null;
-			const refs = mode === "git" && state.kind === "tree" ? await this.git.refIds(project, head ?? "") : [];
-			if (refs.length > 0 && (await this.git.missingObjects(project, refs)).length > 0) refuse("the live repository is missing objects that its own refs name; run git fsck there first");
 			const objectIds = [...ents.values()].flatMap((e) => (e.object === null ? [] : [e.object]));
 			const places = [...new Set([...links, "node_modules"])];
-			const picked = await this.pick(folder, { places, alt, project, files: items.length });
+			const picked = await this.pick(folder, { places, project, files: items.length });
 			chosen = picked.confine;
 			if (onWsl(chosen)) for (const place of places) await ensure(join(folder, place));
-			if (picked.alt !== undefined) await this.fs.writeFile(join(folder, ".git", "objects", "info", "alternates"), `${picked.alt.join("\n")}\n`).catch(() => undefined);
-			if (onWsl(chosen) && mode === "git") await this.liveLineEndings(project, folder);
+			// A git Workspace is its own repository: one commit of the files just copied. Nothing of the live .git comes along (no object, ref, index or reflog), so a credential committed once and deleted since is not in it.
+			if (mode === "git" && state.kind === "tree") {
+				await this.git.init(folder, await this.git.branch(project));
+				await this.fs.writeFile(join(folder, ".git", "config"), await this.git.copyConfig(state.gitDir));
+				await this.liveLineEndings(project, folder);
+				const copied = new Map(items.map((i) => [i.path, i]));
+				await this.git.baseCommit(folder, [...ents.values()].filter((e) => e.kind !== "skipped").map((e) => { const i = copied.get(e.path)!; return { path: e.path, mode: e.kind === "link" ? "120000" as const : i.mode & 0o111 ? "100755" as const : "100644" as const, size: stats.get(e.path)!.size, ...(i.link === undefined ? {} : { link: i.link }) }; }));
+			}
 			let baseId = 0;
 			this.cas.tx(() => {
 				if (this.cas.missing(objectIds).length > 0) throw new WsRefusal("the store dropped objects of this copy while it was made; approve again");
 				const confine = JSON.stringify(picked.confine);
 				this.cas.db.prepare("INSERT INTO workspaces(id, key, project, project_dev, project_ino, mode, git_head, refs, plan, folder, ws_caseless, live_caseless, confine, state, conv, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?)")
-					.run(id, key, project, String(dev.dev), String(dev.ino), mode, head, refs.length === 0 ? null : JSON.stringify(refs), plan, folder, wsCaseless ? 1 : 0, liveCaseless ? 1 : 0, confine, this.now());
+					.run(id, key, project, String(dev.dev), String(dev.ino), mode, head, null, plan, folder, wsCaseless ? 1 : 0, liveCaseless ? 1 : 0, confine, this.now());
 				baseId = Number(this.cas.db.prepare("INSERT INTO commits(workspace, parent, kind, at, note) VALUES (?, NULL, 'base', ?, 'open')").run(id, this.now()).lastInsertRowid);
 				const entry = this.cas.db.prepare('INSERT INTO entries("commit", path, object, hash, size, kind) VALUES (?, ?, ?, ?, ?, ?)');
 				const stat = this.cas.db.prepare("INSERT INTO ws_stat VALUES (?, ?, ?, ?, ?)");
@@ -494,40 +563,7 @@ export class Workspaces {
 		return out;
 	}
 
-	/** The files of the live .git that a git Workspace copies: an allow-list, no objects, hooks, lfs, modules or worktrees. */
-	private async gitAllowList(gitDir: string): Promise<{ rel: string; size: number }[]> {
-		const out: { rel: string; size: number }[] = [];
-		const walk = async (rel: string): Promise<void> => {
-			const abs = join(gitDir, rel);
-			let info;
-			try { info = await this.fs.lstat(abs); } catch { return; }
-			if (info.isSymbolicLink() || rel.endsWith(".lock")) return;
-			if (info.isDirectory()) { for (const name of await this.fs.readdir(abs)) await walk(`${rel}/${name}`); } else if (info.isFile()) out.push({ rel, size: info.size });
-		};
-		for (const name of ["HEAD", "config", "index", "refs", "packed-refs", "info", "shallow", "logs", "reftable"]) await walk(name);
-		return out;
-	}
-
-	private async copyGit(gitDir: string, folder: string, files: { rel: string; size: number }[]): Promise<void> {
-		const dest = join(folder, ".git");
-		await this.fs.mkdir(join(dest, "objects", "pack"), { recursive: true } as never);
-		await this.fs.mkdir(join(dest, "objects", "info"), { recursive: true } as never);
-		for (const f of files) {
-			if (f.rel === "config") { await this.fs.writeFile(join(dest, "config"), await this.git.copyConfig(gitDir)); continue; }
-			await this.fs.mkdir(dirname(join(dest, f.rel)), { recursive: true } as never);
-			await this.fs.copyFile(join(gitDir, f.rel), join(dest, f.rel));
-		}
-		await this.fs.writeFile(join(dest, "objects", "info", "alternates"), `${(await this.altLines(gitDir)).join("\n")}\n`);
-	}
-
-	/** Borrow the live repository's objects: its own object folder, then the alternates it already has. */
-	private async altLines(gitDir: string): Promise<string[]> {
-		const own = join(gitDir, "objects");
-		const inherited = await this.fs.readFile(join(own, "info", "alternates"), "utf8").then((t) => t.split(/\r?\n/u).filter((l) => l !== ""), () => [] as string[]);
-		return [own, ...inherited].map(posix);
-	}
-
-	/** Linux git does not read the Windows system config: copy the live repository's effective core.autocrlf and core.eol into the Workspace's own config. */
+	/** The Workspace's repository does not read the host's system and global config (Linux git in a sandbox never does): copy the live repository's effective core.autocrlf and core.eol into its own config, before the base commit. */
 	private async liveLineEndings(project: string, folder: string): Promise<void> {
 		const lines: string[] = [];
 		for (const name of ["autocrlf", "eol"]) { const r = await this.git.run(project, ["config", "--get", `core.${name}`]); if (r.code === 0 && r.out.toString("utf8").trim() !== "") lines.push(`\t${name} = ${JSON.stringify(r.out.toString("utf8").trim())}`); }
@@ -551,11 +587,17 @@ export class Workspaces {
 		return [...new Set([...head.keys(), ...base.keys()])].filter((p) => (head.get(p)?.hash ?? null) !== (base.get(p)?.hash ?? null) || (head.get(p)?.kind ?? null) !== (base.get(p)?.kind ?? null)).sort();
 	}
 
-	private async walkWs(folder: string): Promise<Map<string, "file" | "other">> {
+	/** The files of the Workspace by their paths, and the folders below the root that could not be listed (a folder that vanished during the walk is not one of them). */
+	private async walkWs(folder: string): Promise<{ out: Map<string, "file" | "other">; unreadable: string[] }> {
 		const out = new Map<string, "file" | "other">();
+		const unreadable: string[] = [];
 		const walk = async (dir: string, rel: string): Promise<void> => {
 			let list: import("node:fs").Dirent[];
-			try { list = await this.fs.readdir(dir, { withFileTypes: true } as never) as unknown as import("node:fs").Dirent[]; } catch (error) { if (rel === "") throw error; return; }
+			try { list = await this.fs.readdir(dir, { withFileTypes: true } as never) as unknown as import("node:fs").Dirent[]; } catch (error) {
+				if (rel === "") throw error;
+				if (code(error) !== "ENOENT" && code(error) !== "ENOTDIR") unreadable.push(rel);
+				return;
+			}
 			for (const e of list) {
 				const path = rel === "" ? e.name : `${rel}/${e.name}`;
 				if (e.name === ".git" || (e.name !== undefined && LINK_NAMES.includes(e.name) && (e.isDirectory() || e.isSymbolicLink()))) continue;
@@ -563,13 +605,15 @@ export class Workspaces {
 			}
 		};
 		await walk(folder, "");
-		return out;
+		return { out, unreadable };
 	}
 
-	/** Compare the Workspace with its stat rows and checkpoint what changed. Returns the new git-ignored paths and whether the ignore check failed. */
-	private async scanNow(row: WsRow, only?: string[], force = false): Promise<{ ignoredNew: string[]; ignoreFailed: boolean }> {
+	/** Compare the Workspace with its stat rows and checkpoint what changed. Returns the new git-ignored paths, whether the ignore check failed, and the folders that could not be read (what they hold is neither changed nor deleted here). */
+	private async scanNow(row: WsRow, only?: string[], force = false): Promise<{ ignoredNew: string[]; ignoreFailed: boolean; unreadable: string[] }> {
 		const stat = new Map((this.cas.db.prepare("SELECT path, size, mtime, hash FROM ws_stat WHERE workspace = ?").all(row.id) as unknown as { path: string; size: number; mtime: number; hash: string }[]).map((s) => [s.path, s]));
-		const onDisk = only === undefined ? await this.walkWs(row.folder) : new Map(only.map((p) => [p, "file" as const]));
+		const walked = only === undefined ? await this.walkWs(row.folder) : undefined;
+		const onDisk = walked?.out ?? new Map(only!.map((p) => [p, "file" as const]));
+		const unreadable = walked?.unreadable ?? [];
 		const candidates = only ?? [...new Set([...onDisk.keys(), ...stat.keys()])];
 		const changed: { path: string; hash: string; size: number; mtime: number; link: boolean }[] = [];
 		const deleted: string[] = [];
@@ -577,7 +621,7 @@ export class Workspaces {
 		const fresh: typeof changed = [];
 		await this.pool(candidates, 16, async (path) => {
 			// A full scan decides presence by the exact names the walk listed: lstat would find `Readme.md` under `README.md` on a case-insensitive folder.
-			if (only === undefined && !onDisk.has(path)) { if (stat.has(path)) deleted.push(path); return; }
+			if (only === undefined && !onDisk.has(path)) { if (stat.has(path) && !unreadable.some((dir) => path.startsWith(`${dir}/`))) deleted.push(path); return; }
 			let info;
 			try { info = await this.fs.lstat(join(row.folder, path)); } catch (error) {
 				if (code(error) === "ENOENT" || code(error) === "ENOTDIR") { if (stat.has(path)) deleted.push(path); return; }
@@ -605,7 +649,7 @@ export class Workspaces {
 			} catch (error) { ignoreFailed = true; this.o.notice(`the live ignore rules could not be read (${msg(error)}); the merge will hold`); }
 		}
 		await this.checkpoint(row, [...changed, ...adds], deleted, touch);
-		return { ignoredNew, ignoreFailed };
+		return { ignoredNew, ignoreFailed, unreadable };
 	}
 
 	/** Insert the changed paths as `checkpoint` commits, in batches by the CAS rule, each batch with its objects in one transaction. */
@@ -669,13 +713,54 @@ export class Workspaces {
 		return confineFor({ confine: s.confine ?? "auto", network: s.network ?? true, distro: s.wslDistro, docker: s.dockerImage }, this.confineDeps(), folder, plan);
 	}
 
+	/**
+	 * Before a host pass over a Workspace: end every process in its container. bubblewrap (native and in WSL) already ends every
+	 * process with its command (--die-with-parent --unshare-all: the sandbox's PID namespace goes with it), but a `docker exec`
+	 * process can outlive its command in the long-lived container and race the host's reads and writes.
+	 */
+	private async quiet(row: WsRow): Promise<void> {
+		try { const c = (JSON.parse(row.confine) as Confine).docker; if (c !== undefined) await dockerKill(this.confineDeps(), c); } catch { /* no container, or an engine that does not answer: the pass goes on */ }
+	}
+
+	/**
+	 * A Workspace of 0.3.1 or 0.3.2 (a sandbox that bound the live git objects) or of 0.3.3 before the system-folders view (a WSL argv that binds the whole root), resumed without a reopen (a retry or a restart), still stores an old sandbox. Before its first command: the backend is picked again
+	 * (the code reopen uses; a Docker container is replaced by a fresh one), which drops the stored `alt` and the object binds, and the alternates file is removed once with a notice. A replacement that fails marks the Workspace
+	 * down, so the run ends held with code `backend`.
+	 */
+	private upgradeOld(id: number): Promise<void> {
+		let done = this.upgrades.get(id);
+		if (done === undefined) {
+			done = (async () => {
+				const row = this.row(id);
+				if (row === undefined) return;
+				await this.chained(row.project, async () => {
+					const old = JSON.parse(row.confine) as Confine;
+					try {
+						// The stored WSL argv and the Docker mounts hold the object binds, so the backend is picked again as a reopen does (a Docker container is removed and a fresh one made first).
+						const places = (old.wsl ?? old.docker)!.places;
+						const picked = await this.pick(row.folder, { places, project: row.project, files: 0, prev: old.wsl, prevDocker: old.docker });
+						if (picked.confine.name !== old.name) throw new Error(picked.confine.why ?? `${old.name} could not be started again`);
+						if (onWsl(picked.confine)) for (const place of places) await wsDir(this.fs, row.folder, place.split("/"), true);
+						this.o.notice(`Shell confinement of this Workspace: ${picked.label}.`);
+						const history = row.mode === "git" ? await wsUnlink(this.fs, row.folder, ".git/objects/info/alternates").catch((error: unknown) => { this.o.notice(`the Workspace's git alternates file could not be removed (${msg(error)})`); return false; }) : false;
+						this.cas.db.prepare("UPDATE workspaces SET confine = ? WHERE id = ?").run(JSON.stringify(picked.confine), id);
+						this.refresh(id);
+						if (history) this.o.notice("Git history is no longer available in this Workspace; its files are unchanged.");
+					} catch (error) { this.down.set(id, `this Workspace's stored sandbox is out of date and could not be replaced (${msg(error)}); approve the run again to reopen it`); }
+				});
+			})();
+			this.upgrades.set(id, done);
+		}
+		return done;
+	}
+
 	/** The open Workspace a shell cwd lies in, when its row names a backend: what ConfinedShellEnv wraps the command with. */
 	shellFor(cwd: string): Found | undefined {
 		for (const row of this.byConv.values()) {
 			if (row.state !== "open") continue;
 			try {
 				const confine = JSON.parse(row.confine) as Confine;
-				if (confine.name !== "none" && isInside(canonicalize(row.folder), canonicalize(cwd))) return { ws: row.folder, confine, deps: this.confineDeps(), down: this.down.get(row.id), mark: (reason) => { this.down.set(row.id, reason); } };
+				if (confine.name !== "none" && isInside(canonicalize(row.folder), canonicalize(cwd))) return { ws: row.folder, project: row.project, confine, deps: this.confineDeps(), down: this.down.get(row.id), mark: (reason) => { this.down.set(row.id, reason); }, ...(needsRepick(confine) && !this.down.has(row.id) ? { upgrade: () => this.upgradeOld(row.id) } : {}) };
 			} catch { /* not this row */ }
 		}
 		return undefined;
@@ -759,6 +844,7 @@ export class Workspaces {
 		};
 		const refuseReason = (p: string, e: Ent | undefined, b: Ent | undefined): string | undefined => {
 			if (b?.kind === "skipped") return "skipped at open";
+			if (p.split("/").some((part) => LINK_NAMES.includes(part))) return "inside node_modules";
 			if (e?.kind === "link") return "link";
 			if (/[\\:*?"<>|-]/u.test(basename(p)) || /[. ]$/u.test(basename(p))) return "name not portable";
 			if (WIDE_SECRET.some((x) => x.test(basename(p)))) return "secret name";
@@ -879,7 +965,7 @@ export class Workspaces {
 			if (e !== undefined) c.ours = items.get(c.path)?.over ?? await this.fs.readFile(wsAbs(c.path)).catch(() => null);
 		}
 		const plan: Plan = {
-			rows: ordered, conflicts, left, oversize, deletes: ordered.filter((r) => r.op === "delete").length, ignored: scan.ignoredNew, ignoreFailed: scan.ignoreFailed, lww,
+			rows: ordered, conflicts, left, oversize, deletes: ordered.filter((r) => r.op === "delete").length, ignored: scan.ignoredNew, ignoreFailed: scan.ignoreFailed, unreadable: scan.unreadable, lww,
 			redecide: async (r, bytes) => {
 				const item = items.get(r.path);
 				if (item === undefined || r.op === "rename" || r.op === "mkdir") return "conflict";
@@ -956,7 +1042,10 @@ export class Workspaces {
 		// Markers go in after the store holds her version. A block the user is editing stays while the live text is the one it was made against.
 		for (const [i, c] of plan.conflicts.entries()) {
 			if (c.text === undefined || before[i] === c.theirsHash) continue;
-			await this.fs.writeFile(c.wsPath, c.text);
+			try { await wsPut(this.fs, row.folder, c.path, { bytes: c.text }); } catch (error) {
+				if (!(error instanceof WsRefusal)) throw error;
+				this.o.notice(`the conflict markers for ${c.path} were not written: ${msg(error)}`);
+			}
 		}
 		return { text: this.conflictText(plan.conflicts, plan.lww), state: "conflicted", code: "conflicts" };
 	}
@@ -1017,8 +1106,10 @@ export class Workspaces {
 		try { if (!existsSync(row.folder)) return fail("folder-missing", ""); } catch { return fail("folder-missing", ""); }
 		const info = await this.fs.lstat(row.project, { bigint: true } as never).catch(() => undefined) as unknown as { dev: bigint; ino: bigint } | undefined;
 		if (info === undefined || String(info.dev) !== row.project_dev || String(info.ino) !== row.project_ino) return fail("target-moved", "");
+		await this.quiet(row);
 		const plan = await this.plan(row);
 		if (plan.ignoreFailed) return fail("ignore-rules", "");
+		if (plan.unreadable.length > 0) return fail("unreadable", LIMITED(plan.unreadable).join("\n"));
 		if (seen !== undefined && shown(plan) !== seen) return { text: "The live folder or the Workspace changed while you answered; nothing was merged. Run /conclave merge again.", state: row.state };
 		if (plan.conflicts.length > 0 && !force) return await this.storeConflicts(row, plan);
 		if (plan.headMoved !== undefined && !confirmed.has("head-moved")) return fail("head-moved", `${plan.headMoved.from} ${plan.headMoved.to}`);
@@ -1132,7 +1223,9 @@ export class Workspaces {
 			const row = this.row(id)!;
 			if (row.state !== "held" && row.state !== "conflicted") return { text: "nothing to merge", ended: false };
 			if (!existsSync(row.folder)) { this.hold(row.id, "folder-missing"); return { text: `Merge held: ${holdText("folder-missing", null)}`, ended: false }; }
+			await this.quiet(row);
 			const plan = await this.plan(row);
+			if (plan.unreadable.length > 0) { const detail = LIMITED(plan.unreadable).join("\n"); this.hold(row.id, "unreadable", detail); return { text: `Merge held: ${holdText("unreadable", detail)}`, ended: false }; }
 			const reasons: string[] = [];
 			const confirmed = new Set<string>();
 			if (row.state === "held" && row.hold !== "conflicts") reasons.push(holdText(row.hold, row.hold_detail));

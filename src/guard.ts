@@ -167,7 +167,7 @@ export interface PathVerdict {
 }
 
 // Names that never open under the read exception for <home>/skills, whatever folder they sit in.
-const SECRET_BASENAME = [...ENV_BASENAME, /\.(?:pem|key|p12|pfx|kdbx)$/iu, /^id_(?:rsa|ed25519|ecdsa)/iu, /\.sqlite/iu, /^(?:auth\.json|\.netrc|\.npmrc)$/iu];
+const SECRET_BASENAME = [...ENV_BASENAME, /\.(?:pem|key|p12|pfx|kdbx)$/iu, /^id_(?:rsa|dsa|ed25519|ecdsa)/iu, /\.sqlite/iu, /^(?:auth\.json|\.netrc|\.npmrc)$/iu];
 
 /** True when a read of `target` (canonical) falls under the home exception: inside the real <home>/skills, and not a secret name. */
 function homeSkillsRead(target: string, base: string, config: GuardConfig): boolean {

@@ -17,10 +17,10 @@ export interface WslDeps {
 	run(args: string[], o?: { stdin?: string; timeoutMs?: number; signal?: AbortSignal; onData?: (chunk: Buffer, stream: "stdout" | "stderr") => void }): Promise<WslRun>;
 }
 /** A Workspace's WSL backend, kept in the row's `confine`: the distro and user pinned at open, and the bwrap argv up to `--chdir <workspace>`. */
-export interface WslConf { distro: string; user: string; ws: string; ext4: string; argv: string[]; alt: string[]; places: string[] }
+export interface WslConf { distro: string; user: string; ws: string; ext4: string; argv: string[]; places: string[] }
 /** The distro, user and ext4 folder of a Workspace's sandbox folders (a WslConf has them, and so does a DockerConf on Windows). */
 export type Remote = { distro: string; user: string; ext4: string };
-export interface WslPlan { places: string[]; alt: string[]; project: string; files: number; prev?: WslConf; prevDocker?: DockerConf }
+export interface WslPlan { places: string[]; project: string; files: number; prev?: WslConf; prevDocker?: DockerConf }
 export class SelfTestError extends Error {}
 
 export function wslDeps(): WslDeps {
@@ -52,15 +52,7 @@ export function wslDeps(): WslDeps {
 
 export type Who = { distro?: string; user?: string };
 export const via = (w: Who, argv: string[]): string[] => [...(w.distro === undefined ? [] : ["--distribution", w.distro]), ...(w.user === undefined ? [] : ["--user", w.user]), "--exec", ...argv];
-const key = (p: string): string => win32.resolve(p).replaceAll("\\", "/").toLowerCase();
 export const posixOf = (p: string): string => p.replaceAll("\\", "/");
-/** A Windows path that may not be bound or mounted: protected, the profile or a direct child of it, or something holding the Workspace root, PIROBOROS_HOME or a deny root. */
-export function wslBad(d: ConfineDeps, path: string): boolean {
-	const k = key(path);
-	const above = (root: string): boolean => key(root) === k || key(root).startsWith(`${k}/`);
-	return !d.allowed(path) || above(d.home) || key(win32.dirname(path)) === key(d.home) || [d.wsRoot, d.piroHome, ...d.deny].some(above);
-}
-
 /** One call of a constant script; a refusal names the call, the distro or user, or what wsl.exe said. */
 export async function call(d: WslDeps, w: Who, what: string, script: string, args: string[] = [], timeoutMs = 20_000): Promise<string> {
 	const r = await d.run(via(w, ["sh", "-c", script, "sh", ...args]), { timeoutMs });
@@ -77,9 +69,9 @@ export const WSLPATH = 'for p; do wslpath -a -u "$p" || echo; done';
 const REALPATH = 'for p; do realpath -e -- "$p" 2>/dev/null || echo; done';
 const PIDRUN = 'echo $$ > "$1"; shift; exec "$@"';
 const KILL = 'kill -KILL "$(cat -- "$1")" 2>/dev/null; rm -f -- "$1"';
-// Runs inside the sandbox: write and remove a file in the Workspace, no auth.json, a readable resolv.conf, no Windows program, no System32, then the
+// Runs inside the sandbox: write and remove a file in the Workspace, no auth.json, a readable resolv.conf, no Windows program, no System32, nothing listed in the live project folder, then the
 // node version and what each masked mount lists.
-const SELF_TEST = 'm="$1/.piroboros-selftest"; : > "$m" || { echo "the Workspace is not writable"; exit 1; }; rm -f "$m"; [ ! -e "$2/auth.json" ] || { echo "auth.json is visible"; exit 1; }; [ "$3" = 0 ] || [ -r /etc/resolv.conf ] || { echo "resolv.conf is not readable"; exit 1; }; command -v perl >/dev/null && { perl -e \'socket(S,40,1,0) and exit 1; exit($!+0==97?0:2)\' || { echo "an AF_VSOCK socket can be created"; exit 1; }; }; if "$4" >/dev/null 2>&1; then echo "a Windows program ran"; exit 1; fi; [ ! -e "$5" ] || { echo "the Windows System32 folder is visible"; exit 1; }; echo "node $(node --version 2>/dev/null || echo none)"; shift 5; for m; do echo "mount $m"; ls -A "$m" 2>/dev/null; done; true';
+const SELF_TEST = 'm="$1/.piroboros-selftest"; : > "$m" || { echo "the Workspace is not writable"; exit 1; }; rm -f "$m"; [ ! -e "$2/auth.json" ] || { echo "auth.json is visible"; exit 1; }; [ "$3" = 0 ] || [ -r /etc/resolv.conf ] || { echo "resolv.conf is not readable"; exit 1; }; command -v perl >/dev/null && { perl -e \'socket(S,40,1,0) and exit 1; exit($!+0==97?0:2)\' || { echo "an AF_VSOCK socket can be created"; exit 1; }; }; if "$4" >/dev/null 2>&1; then echo "a Windows program ran"; exit 1; fi; [ ! -e "$5" ] || { echo "the Windows System32 folder is visible"; exit 1; }; [ -z "$6" ] || [ -z "$(ls -A -- "$6" 2>/dev/null)" ] || { echo "the live project is visible"; exit 1; }; echo "node $(node --version 2>/dev/null || echo none)"; shift 6; for m; do echo "mount $m"; ls -A "$m" 2>/dev/null; done; true';
 export const WRAPPER = 'IFS= read -rd "" c; exec bash -c "$c"';
 
 export interface WslInfo { distro: string; user: string; uid: string; gid: string; home: string; net: string; mounts: string[] }
@@ -132,7 +124,7 @@ async function settled<T>(d: WslDeps, who: Who, fn: (real: (p: string) => string
  * Choose bubblewrap in WSL for the Workspace folder `ws` (a Windows path under `<wsRoot>/<home hash>/<id>`): resolve and pin the distro and user,
  * translate the Windows paths, create the ext4 folders, build the argv and run the self-test. A refusal throws; a failed check throws SelfTestError.
  */
-export async function wslPick(s: { network: boolean; distro?: string }, d: ConfineDeps, ws: string, p: WslPlan): Promise<{ confine: Confine; label: string; notice: string[]; alt: string[] }> {
+export async function wslPick(s: { network: boolean; distro?: string }, d: ConfineDeps, ws: string, p: WslPlan): Promise<{ confine: Confine; label: string; notice: string[] }> {
 	const w = d.wsl!;
 	if (/^docker-desktop/iu.test(s.distro ?? "")) throw new Error("workspace.wsl.distro names Docker Desktop's own distro, which cannot run commands");
 	let info: WslInfo;
@@ -143,26 +135,24 @@ export async function wslPick(s: { network: boolean; distro?: string }, d: Confi
 	const who = { distro: info.distro, user: info.user };
 	const notice: string[] = [];
 	if (p.prev !== undefined && (p.prev.distro !== info.distro || p.prev.user !== info.user)) notice.push(`The earlier sandbox folders of this Workspace stay in ${p.prev.distro} as ${p.prev.user} at ${p.prev.ext4}; remove them there.`);
-	// Deny-root check of each Windows path before it is translated.
-	for (const x of [ws, ...p.alt]) if (win32.isAbsolute(x) && !/^[A-Za-z]:[\\/]/u.test(x)) throw new Error(`${x} is not on a local Windows drive`);
-	const alt = p.alt.filter((a) => win32.isAbsolute(a) && !wslBad(d, a));
+	if (win32.isAbsolute(ws) && !/^[A-Za-z]:[\\/]/u.test(ws)) throw new Error(`${ws} is not on a local Windows drive`);
 	const hash = win32.basename(win32.dirname(ws));
 	const selftest = win32.join(d.wsRoot, hash, "selftest");
 	if (!existsSync(win32.join(selftest, "w.exe"))) { mkdirSync(selftest, { recursive: true }); copyFileSync(win32.join(w.systemRoot, "System32", "whoami.exe"), win32.join(selftest, "w.exe")); }
 	const system32 = win32.join(w.systemRoot, "System32");
-	const wins = [...new Set([ws, d.wsRoot, d.piroHome, ...d.deny, selftest, system32, ...alt])];
+	const wins = [...new Set([ws, d.wsRoot, d.piroHome, ...d.deny, selftest, system32, ...(p.project === "" ? [] : [p.project])])];
 	const out = (await call(w, who, "translating paths", WSLPATH, wins.map((x) => win32.resolve(x)))).split("\n");
 	const to = new Map(wins.map((x, i) => [x, out[i] ?? ""]));
 	const lin = (x: string): string => to.get(x) ?? "";
-	for (const x of [ws, ...alt]) if (!info.mounts.some((m) => within(m, lin(x)))) throw new Error(`${x} is not on a local Windows drive`);
+	if (!info.mounts.some((m) => within(m, lin(ws)))) throw new Error(`${ws} is not on a local Windows drive`);
 	const login = await loginValues(w, who, info.mounts);
 	const wsLin = lin(ws);
 	const ext4 = `${info.home}/.local/state/piroboros-ws/${hash}/${win32.basename(ws)}`;
 	const nm = p.places.map((place, i) => [`${ext4}/nm/${i}`, `${wsLin}/${place}`]);
 	await call(w, who, "creating the sandbox folders", 'mkdir -p -m 0700 -- "$@"', [`${ext4}/run`, ...nm.map(([src]) => src!)]);
 	const env = [["PATH", login.path.join(":")], ["HOME", info.home], ["USER", info.user], ["LOGNAME", info.user], ["LANG", login.lang], ["TMPDIR", "/tmp"], ["NO_COLOR", "1"], ["TERM", "dumb"]];
-	const c = { ws: wsLin, cwd: wsLin, net: s.network, path: login.path.join(":"), wsl: { mounts: info.mounts, alt: alt.map(lin), nm, env, extra: [] as string[] } };
-	const test = ["sh", "-c", SELF_TEST, "sh", wsLin, lin(d.piroHome), s.network ? "1" : "0", `${lin(selftest)}/w.exe`, lin(system32), ...info.mounts];
+	const c = { ws: wsLin, cwd: wsLin, net: s.network, path: login.path.join(":"), project: p.project === "" ? undefined : lin(p.project), wsl: { mounts: info.mounts, nm, env, extra: [] as string[] } };
+	const test = ["sh", "-c", SELF_TEST, "sh", wsLin, lin(d.piroHome), s.network ? "1" : "0", `${lin(selftest)}/w.exe`, lin(system32), c.project ?? "", ...info.mounts];
 	const built = await settled(w, who, (real) => {
 		const dl: ConfineDeps = { ...d, platform: "linux", home: info.home, piroHome: lin(d.piroHome), wsRoot: lin(d.wsRoot), deny: d.deny.map(lin).filter((x) => x !== ""), allowed: () => true, real, read: () => undefined };
 		return { real: bwrapArgs(dl, c, []), test: bwrapArgs(dl, { ...c, wsl: { ...c.wsl, extra: [lin(selftest)] } }, test) };
@@ -171,7 +161,7 @@ export async function wslPick(s: { network: boolean; distro?: string }, d: Confi
 	const lines = ran.out.toString("utf8").split("\n");
 	if (ran.timedOut || ran.code !== 0) throw new SelfTestError(ran.timedOut ? "the self-test did not finish within 20 s" : lines[0] || ran.err.trim().split("\n")[0] || "bwrap did not start");
 	// Each masked mount may list only the first folder of a bound path inside it.
-	const bound = [wsLin, ...c.wsl.alt, lin(selftest), ...nm.map(([, dst]) => dst!), login.resolv];
+	const bound = [wsLin, lin(selftest), ...nm.map(([, dst]) => dst!), login.resolv];
 	let mount = "";
 	for (const line of lines.slice(1)) {
 		if (line.startsWith("mount ")) { mount = line.slice(6); continue; }
@@ -184,10 +174,9 @@ export async function wslPick(s: { network: boolean; distro?: string }, d: Confi
 	if (need !== undefined && (have === "none" || lt(have, need))) notice.push(`Node in ${info.distro} is ${have}; this project needs >=${need}. Install a newer Node in the distro for npm commands.`);
 	if (s.network) notice.push(`Network: on. Confined commands can reach the WSL VM's network, which includes the Windows host (${info.net === "nat" || info.net === "mirrored" ? `networking mode: ${info.net}` : "through the NAT gateway, or on Windows localhost with mirrored networking"}), and can send any file they can see.`);
 	if (p.files > 1000) notice.push(`git in the sandbox reads this project through drvfs: the first git status takes about ${Math.round(p.files * 0.0057)} s, later ones about ${(0.5 + p.files * 0.0003).toFixed(1)} s.`);
-	const left = [...p.alt.filter((a) => !alt.includes(a)), ...built.real.refused];
-	if (left.length > 0) notice.push(`Left hidden in the sandbox because they are protected: ${left.join(", ")}`);
+	if (built.real.refused.length > 0) notice.push(`Left hidden in the sandbox because they are protected: ${built.real.refused.join(", ")}`);
 	if (login.fallback) notice.push(`The login shell of ${info.distro} did not answer, so PATH comes from wsl.exe itself; put toolchain PATH lines in ~/.profile.`);
-	return { confine: { name: "bubblewrap", bwrap: "/usr/bin/bwrap", net: s.network, wsl: { ...who, ws: wsLin, ext4, argv: built.real.args, alt: p.alt, places: p.places } }, label: `bubblewrap in WSL (${info.distro})`, notice, alt: alt.map(lin) };
+	return { confine: { name: "bubblewrap", bwrap: "/usr/bin/bwrap", net: s.network, wsl: { ...who, ws: wsLin, ext4, argv: built.real.args, places: p.places } }, label: `bubblewrap in WSL (${info.distro})`, notice };
 }
 
 /** The sandbox folders of a Workspace, removed with the Workspace (exactly the computed path, never one read from Workspace content). */

@@ -3,14 +3,14 @@ import { posix, win32 } from "node:path";
 import { err, ExecutionError, type Result, type ShellExecResult } from "@earendil-works/pi-durable/env";
 import type { ShellEnv } from "../durable.ts";
 import { type Confine, type ConfineDeps, within } from "./confine.ts";
-import { call, posixOf, type Remote, resolveWsl, via, WRAPPER, WSLPATH, wslBad, wslCommand, type WslPlan } from "./wsl.ts";
+import { call, posixOf, type Remote, resolveWsl, via, WRAPPER, WSLPATH, wslCommand, type WslPlan } from "./wsl.ts";
 
 // The Docker backend (P27e3): one container per Workspace, created at open and reopen, removed at merge, discard, hold and recovery. The handle is the 64-hex container ID.
 // Natively the docker CLI runs as a child; on Windows it runs through the WSL runner against the distro's own Engine, never Docker Desktop. The engine's built-in seccomp
 // profile is kept (it refuses AF_VSOCK sockets and io_uring); an engine without seccomp is refused and the self-test checks both blocks.
 
 /** A Workspace's Docker backend, kept in the row's `confine`. `remote` is the distro, user and ext4 folder on Windows. */
-export interface DockerConf { cli: string; config: string; container: string; image: string; net: boolean; alt: string[]; places: string[]; remote?: Remote }
+export interface DockerConf { cli: string; config: string; container: string; image: string; net: boolean; places: string[]; remote?: Remote }
 
 const SOCK = "unix:///var/run/docker.sock";
 // Runs in the container: the Workspace is writable, and (with perl) an AF_VSOCK socket cannot be created and io_uring_setup fails with EPERM.
@@ -26,17 +26,16 @@ export async function docker(d: ConfineDeps, c: DockerConf, args: string[], ms =
 const last = (out: string): string => out.trim().split("\n").at(-1) ?? "";
 
 /** Choose Docker for the Workspace folder `ws`: the checks, the container and its self-test. A refusal throws with the reason. */
-export async function dockerPick(s: { network: boolean; distro?: string; image: string }, d: ConfineDeps, ws: string, p: WslPlan): Promise<{ confine: Confine; label: string; notice: string[]; alt: string[] }> {
+export async function dockerPick(s: { network: boolean; distro?: string; image: string }, d: ConfineDeps, ws: string, p: WslPlan): Promise<{ confine: Confine; label: string; notice: string[] }> {
 	const win = d.platform === "win32";
 	const P = win ? win32 : posix;
 	const hash = P.basename(P.dirname(ws));
 	const id = P.basename(ws);
 	const notice: string[] = [];
 	let host = ws;
-	let alt = p.alt;
 	let user: string[] = typeof process.getuid === "function" && !win ? ["--user", `${process.getuid()}:${process.getgid!()}`] : [];
 	let nm: string[][] = [];
-	let c: DockerConf = { cli: "", config: `${d.wsRoot}/${hash}/docker-config`, container: "", image: s.image, net: s.network, alt: p.alt, places: p.places };
+	let c: DockerConf = { cli: "", config: `${d.wsRoot}/${hash}/docker-config`, container: "", image: s.image, net: s.network, places: p.places };
 	let where = "a shell";
 	if (win) {
 		const w = d.wsl;
@@ -45,13 +44,10 @@ export async function dockerPick(s: { network: boolean; distro?: string; image: 
 		const info = await resolveWsl(w, prev === undefined ? { distro: s.distro } : { distro: prev.distro, user: prev.user }, false).catch((error: unknown) => { if (prev === undefined) throw error; return resolveWsl(w, { distro: s.distro }, false); });
 		const who = { distro: info.distro, user: info.user };
 		where = `the ${info.distro} distro`;
-		for (const x of [ws, ...p.alt]) if (!/^[A-Za-z]:[\\/]/u.test(x)) throw new Error(`${x} is not on a local Windows drive`);
-		alt = p.alt.filter((a) => !wslBad(d, a));
-		if (alt.length < p.alt.length) notice.push(`Left hidden in the sandbox because they are protected: ${p.alt.filter((a) => !alt.includes(a)).join(", ")}`);
-		const lin = (await call(w, who, "translating paths", WSLPATH, [ws, ...alt].map((x) => win32.resolve(x)))).split("\n");
-		for (const x of lin.slice(0, alt.length + 1)) if (!info.mounts.some((m) => within(m, x))) throw new Error(`${x} is not on a local Windows drive`);
-		host = lin[0]!;
-		alt = lin.slice(1, alt.length + 1);
+		if (!/^[A-Za-z]:[\\/]/u.test(ws)) throw new Error(`${ws} is not on a local Windows drive`);
+		const lin = (await call(w, who, "translating paths", WSLPATH, [win32.resolve(ws)])).split("\n")[0]!;
+		if (!info.mounts.some((m) => within(m, lin))) throw new Error(`${lin} is not on a local Windows drive`);
+		host = lin;
 		const base = `${info.home}/.local/state/piroboros-ws/${hash}`;
 		const ext4 = `${base}/${id}`;
 		nm = p.places.map((place, i) => [`${ext4}/nm/${i}`, `/work/${place}`]);
@@ -76,14 +72,13 @@ export async function dockerPick(s: { network: boolean; distro?: string; image: 
 	if (!/seccomp/u.test(sec)) throw new Error("the engine has no seccomp, so its default profile cannot block AF_VSOCK and io_uring");
 	if ((await docker(d, c, ["image", "inspect", "--format", "{{.Id}}", s.image])).code !== 0) throw new Error(`image ${s.image} is not present; run docker pull ${s.image} in ${where}`);
 	if (p.prevDocker !== undefined) await docker(d, c, ["rm", "-f", p.prevDocker.container]);
-	const mount = (src: string, dst: string, ro = false): string[] => {
+	const mount = (src: string, dst: string): string[] => {
 		if (!/^[^,:"\n]+$/u.test(src)) throw new Error(`${src} holds a character a Docker mount cannot take`);
-		return ["--mount", `type=bind,source=${src},target=${dst}${ro ? ",readonly" : ""}`];
+		return ["--mount", `type=bind,source=${src},target=${dst}`];
 	};
-	const inside = alt.map((_, i) => (i === 0 ? "/piroboros-objects" : `/piroboros-objects-${i}`));
 	const name = `piroboros-ws-${hash}-${id}-${Date.now().toString(36)}`;
 	r = await docker(d, c, ["run", "-d", "--pull", "never", "--init", "--name", name, "--label", `piroboros.home=${hash}`, "--label", `piroboros.ws=${id}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "1024",
-		"--network", s.network ? "bridge" : "none", "-e", "HOME=/tmp", ...mount(host, "/work"), ...nm.flatMap(([src, dst]) => mount(src!, dst!)), ...alt.flatMap((a, i) => mount(a, inside[i]!, true)), "-w", "/work", ...user, s.image, "sleep", "infinity"], 30_000);
+		"--network", s.network ? "bridge" : "none", "-e", "HOME=/tmp", ...mount(host, "/work"), ...nm.flatMap(([src, dst]) => mount(src!, dst!)), "-w", "/work", ...user, s.image, "sleep", "infinity"], 30_000);
 	const container = /^[0-9a-f]{64}$/mu.exec(r.out)?.[0];
 	if (r.code !== 0 || container === undefined) throw new Error(`docker run failed (${last(r.out) || "no container ID"})`);
 	c = { ...c, container };
@@ -93,11 +88,14 @@ export async function dockerPick(s: { network: boolean; distro?: string; image: 
 		if (/^skipped$/mu.test(t.out)) notice.push("The container self-test skipped the seccomp checks: the image has no perl.");
 	} catch (error) { await docker(d, c, ["rm", "-f", container]); throw error; }
 	if (s.network) notice.push(win ? "Network: on. Confined commands can reach the WSL VM's network, which includes the Windows host, and can send any file they can see." : "Network: on. Confined commands can reach your network, and can send any file they can see.");
-	return { confine: { name: "docker", net: s.network, docker: c }, label: c.remote === undefined ? "docker" : `docker in WSL (${c.remote.distro})`, notice, alt: inside };
+	return { confine: { name: "docker", net: s.network, docker: c }, label: c.remote === undefined ? "docker" : `docker in WSL (${c.remote.distro})`, notice };
 }
 
 /** Remove a Workspace's container, best effort. */
 export const dockerRemove = (d: ConfineDeps, c: DockerConf): Promise<unknown> => docker(d, c, ["rm", "-f", c.container]);
+
+/** End every process in a Workspace's container, best effort: `docker exec` processes outlive their command, and the host must not read or write the folder beside one. */
+export const dockerKill = (d: ConfineDeps, c: DockerConf): Promise<unknown> => docker(d, c, ["kill", c.container]);
 
 /** Remove every container of this home hash whose Workspace id is not open in this store; another home's containers carry another hash and are never listed. */
 export async function dockerSweep(d: ConfineDeps, c: DockerConf, hash: string, open: Set<string>): Promise<void> {

@@ -1,11 +1,14 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { Writable } from "node:stream";
 import { canonicalize } from "../paths.ts";
 
-// Host git for Workspaces. piroboros never runs git with a Workspace as the repository: every call here is against the live
-// repository, carries SAFE_GIT, and gets an environment without any GIT_* name in any letter case, so nothing in the
-// user's shell, a git hook parent or a Workspace config changes what it reads or runs.
+// Host git for Workspaces. Every call here carries SAFE_GIT and gets an environment without any GIT_* name in any letter case,
+// so nothing in the user's shell, a git hook parent or a Workspace config changes what it reads or runs. Calls are against the
+// live repository, with one exception: `init`, `baseCommit` (`fast-import` and `read-tree`) build the Workspace's own repository at open, when the host has
+// just written the folder and nothing of Vesperia's is in it. After that piroboros never runs git with a Workspace as the repository.
 
 /** A message for the user: the reason a Workspace cannot open or a mode cannot be resolved, with the way out. */
 export class WsRefusal extends Error {}
@@ -34,8 +37,8 @@ const dubious = (project: string): string => ` piroboros ignores GIT_* variables
 
 export type GitState = { kind: "none" } | { kind: "tree"; toplevel: string; gitDir: string };
 
-/** The config keys copied into a git Workspace; everything else (fsmonitor, hooksPath, filters, includes, credentials) is dropped. */
-const CONFIG_KEYS = /^(?:core\.(?:repositoryformatversion|bare|filemode|symlinks|ignorecase|precomposeunicode|autocrlf|eol|safecrlf|logallrefupdates|quotepath)|extensions\.(?:objectformat|refstorage)|user\.(?:name|email)|remote\..+\.(?:url|fetch)|branch\..+\.(?:remote|merge))$/u;
+/** The config keys copied into a git Workspace; everything else (fsmonitor, hooksPath, filters, includes, credentials, the repository format) is dropped. */
+const CONFIG_KEYS = /^(?:core\.(?:bare|filemode|symlinks|ignorecase|precomposeunicode|autocrlf|eol|safecrlf|logallrefupdates|quotepath)|user\.(?:name|email)|remote\..+\.(?:url|fetch)|branch\..+\.(?:remote|merge))$/u;
 
 export class HostGit {
 	readonly home: string;
@@ -46,7 +49,8 @@ export class HostGit {
 		this.spy = spy;
 	}
 
-	run(cwd: string, args: string[], options: { input?: string | Buffer; literal?: boolean } = {}): Promise<GitResult> {
+	/** `feed` writes a large stdin itself (await `put` on each chunk); `input` is a small one. */
+	run(cwd: string, args: string[], options: { input?: string | Buffer; feed?: (stdin: Writable) => Promise<void>; literal?: boolean } = {}): Promise<GitResult> {
 		const env = gitEnv(options.literal ?? true);
 		const argv = [...safeGit(this.home), ...args];
 		this.spy?.({ args: argv, env, cwd });
@@ -59,8 +63,10 @@ export class HostGit {
 			child.stderr.on("data", (text: string) => { if (err.length < 8_000) err += text; });
 			child.stdin.on("error", () => { /* git exited before reading its input */ });
 			child.on("error", (error: NodeJS.ErrnoException) => reject(error.code === "ENOENT" ? new WsRefusal("git is not installed or not on PATH, so a Workspace cannot be made; install git, or set workspace.enabled to false to run in place") : error));
-			child.on("close", (code) => resolve({ code, out: Buffer.concat(out), err }));
-			child.stdin.end(options.input);
+			let fed: unknown;
+			child.on("close", (code) => (fed !== undefined ? reject(fed) : resolve({ code, out: Buffer.concat(out), err })));
+			if (options.feed === undefined) { child.stdin.end(options.input); return; }
+			options.feed(child.stdin).then(() => child.stdin.end(), (error: unknown) => { fed = error; child.kill(); });
 		});
 	}
 
@@ -124,20 +130,64 @@ export class HostGit {
 		return r.code === 0 ? r.out.toString("utf8").trim() : undefined;
 	}
 
-	/** The commit ids HEAD and every ref point at. `knownHead` is the caller's own `head()` ("" for none), to skip a second call. */
-	async refIds(project: string, knownHead?: string): Promise<string[]> {
-		const refs = await this.run(project, ["for-each-ref", "--format=%(objectname)"]);
-		if (refs.code !== 0) throw this.fail(project, refs, "for-each-ref");
-		const head = knownHead === undefined ? await this.head(project) : knownHead === "" ? undefined : knownHead;
-		return [...new Set([...(head === undefined ? [] : [head]), ...refs.out.toString("utf8").split(/\r?\n/u).filter((id) => id !== "")])];
+	/** The branch HEAD is on, or undefined when it is detached. */
+	async branch(project: string): Promise<string | undefined> {
+		const r = await this.run(project, ["symbolic-ref", "-q", "--short", "HEAD"]);
+		return r.code === 0 && r.out.toString("utf8").trim() !== "" ? r.out.toString("utf8").trim() : undefined;
 	}
 
-	/** The ids of the list the repository does not have. */
-	async missingObjects(project: string, ids: string[]): Promise<string[]> {
-		if (ids.length === 0) return [];
-		const r = await this.run(project, ["cat-file", "--batch-check"], { input: `${ids.join("\n")}\n` });
-		if (r.code !== 0) throw this.fail(project, r, "cat-file");
-		return r.out.toString("utf8").split(/\r?\n/u).filter((line) => /\bmissing$/u.test(line)).map((line) => line.split(" ")[0]!);
+	/** A new empty repository in `folder` (no hook templates), HEAD on `branch` when given. See the note at the top: this runs against a Workspace. */
+	async init(folder: string, branch: string | undefined): Promise<void> {
+		const r = await this.run(folder, ["init", "-q", "--template="]);
+		if (r.code !== 0) throw this.fail(folder, r, "init");
+		if (branch === undefined) return;
+		const h = await this.run(folder, [`--git-dir=${join(folder, ".git")}`, "symbolic-ref", "HEAD", `refs/heads/${branch}`]);
+		if (h.code !== 0) throw this.fail(folder, h, "symbolic-ref");
+	}
+
+	/**
+	 * Make the one base commit of `folder` from the copied files (fixed identity), as one `fast-import` stream of the raw bytes, then `read-tree` for the index. Neither runs a clean
+	 * filter, an eol conversion or a hook, so no filter of the user's global or system git config runs on the host, and a few loose objects stay out of the Workspace.
+	 * Each file is read from `folder` once, one at a time. See the note at the top: this runs against a Workspace.
+	 */
+	async baseCommit(folder: string, files: { path: string; mode: "100644" | "100755" | "120000"; size: number; link?: string }[]): Promise<void> {
+		const where = [`--git-dir=${join(folder, ".git")}`, `--work-tree=${folder}`];
+		const ref = await this.run(folder, [...where, "symbolic-ref", "-q", "HEAD"]);
+		const branch = ref.out.toString("utf8").trim();
+		if (ref.code !== 0 || !branch.startsWith("refs/heads/")) throw this.fail(folder, ref, "symbolic-ref");
+		const quote = (path: string): string => `"${path.replace(/[\\"\x00-\x1f\x7f]/gu, (c) => (c === "\\" || c === '"' ? `\\${c}` : `\\${c.charCodeAt(0).toString(8).padStart(3, "0")}`))}"`;
+		const put = (w: Writable, chunk: Buffer | string): Promise<void> => (w.write(chunk) || w.destroyed ? Promise.resolve() : new Promise((done) => { const end = (): void => { w.off("drain", end); w.off("close", end); done(); }; w.once("drain", end); w.once("close", end); }));
+		const feed = async (w: Writable): Promise<void> => {
+			// Small pieces gather into ~256 KiB writes: a pipe write per piece costs more than reading the file. A big file streams through.
+			let batch: Buffer[] = [];
+			let held = 0;
+			const add = async (chunk: Buffer | string): Promise<void> => { const b = typeof chunk === "string" ? Buffer.from(chunk) : chunk; batch.push(b); held += b.length; if (held >= 262_144) await flush(); };
+			const flush = async (): Promise<void> => { const b = Buffer.concat(batch); batch = []; held = 0; await put(w, b); };
+			await add(`commit ${branch}\ncommitter piroboros <piroboros@localhost> ${Math.floor(Date.now() / 1000)} +0000\ndata <<EOM\npiroboros Workspace base\nEOM\n`);
+			// A file read costs about 0.7 ms here, so 16 small files are read ahead (at most 16 MiB held); each result is the bytes, or the error to throw in its turn.
+			const small = (f: (typeof files)[number]): boolean => f.link === undefined && f.size <= 1_048_576;
+			const ahead: Promise<Buffer | Error>[] = [];
+			let next = 0;
+			for (let i = 0; i < files.length; i += 1) {
+				while (ahead.length < 16 && next < files.length) { const g = files[next++]!; ahead.push(small(g) ? readFile(join(folder, g.path)).catch((error: Error) => error) : Promise.resolve(Buffer.alloc(0))); }
+				const f = files[i]!;
+				const bytes = await ahead.shift()!;
+				if (bytes instanceof Error) throw bytes;
+				if (w.destroyed) return;
+				await add(`M ${f.mode} inline ${quote(f.path)}\n`);
+				if (f.link !== undefined) { const text = Buffer.from(f.link); await add(`data ${text.length}\n`); await add(text); } else if (small(f)) {
+					if (bytes.length !== f.size) throw new Error(`${f.path} changed while it was committed`);
+					await add(`data ${f.size}\n`); await add(bytes);
+				} else { await add(`data ${f.size}\n`); await flush(); for await (const chunk of createReadStream(join(folder, f.path))) await put(w, chunk as Buffer); }
+				await add("\n");
+			}
+			await add("done\n");
+			await flush();
+		};
+		const imported = await this.run(folder, [...where, "fast-import", "--quiet", "--done", "--date-format=raw"], { feed });
+		if (imported.code !== 0) throw this.fail(folder, imported, "fast-import");
+		const index = await this.run(folder, [...where, "read-tree", "HEAD"]);
+		if (index.code !== 0) throw this.fail(folder, index, "read-tree");
 	}
 
 	/** The live repository's own config reduced to the allowed keys, as a fresh INI text. Every remote gets a push URL that fails. */

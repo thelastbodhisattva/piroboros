@@ -413,17 +413,24 @@ export class Writer {
 		throw hold("the store kept dropping snapshot objects; /conclave merge tries again");
 	}
 
-	private async checkParents(project: string, canonicalProject: string, abs: string, rel: string): Promise<void> {
+	/** Why `abs` may not be touched, or undefined: a link or a non-folder among its parents, a canonical path outside the project, or the guard. Forward and reverse passes both use it. */
+	private async pathProblem(project: string, canonicalProject: string, abs: string): Promise<string | undefined> {
 		let cur = project;
 		for (const part of dirname(abs).slice(project.length).split(/[\\/]/u).filter((s) => s !== "")) {
 			cur = join(cur, part);
 			let info;
 			try { info = await this.d.fs.lstat(cur); } catch (error) { if (code(error) === "ENOENT") break; throw error; }
-			if (info.isSymbolicLink()) throw new HoldError("preflight", `${rel}: a link lies in its path`);
-			if (!info.isDirectory()) throw new HoldError("preflight", `${rel}: a parent is not a folder`);
+			if (info.isSymbolicLink()) return "a link lies in its path";
+			if (!info.isDirectory()) return "a parent is not a folder";
 		}
-		if (!isInside(canonicalProject, canonicalize(abs))) throw new HoldError("preflight", `${rel} resolves outside the project`);
-		if (!this.d.allowed(abs)) throw new HoldError("preflight", `${rel} is protected`);
+		if (!isInside(canonicalProject, canonicalize(abs))) return "it resolves outside the project";
+		if (!this.d.allowed(abs)) return "it is protected";
+		return undefined;
+	}
+
+	private async checkParents(project: string, canonicalProject: string, abs: string, rel: string): Promise<void> {
+		const problem = await this.pathProblem(project, canonicalProject, abs);
+		if (problem !== undefined) throw new HoldError("preflight", `${rel}: ${problem}`);
 	}
 
 	/** Per volume: the tmp of every row, the rollback tmp of a displaced one, and the snapshot in the store, plus a margin. */
@@ -474,7 +481,10 @@ export class Writer {
 	private async classify(row: Row, project: string, caseless: boolean): Promise<{ verdict: "unchanged" | "act" | "changed" | "protected"; reason?: string; abs: string; from?: string; fromAbsent?: boolean }> {
 		const abs = await this.target(project, row, caseless); const from = row.from === null ? undefined : join(dirname(await this.name(project, row.from, caseless)), basename(row.from));
 		const target = from ?? abs;
-		if (!this.d.allowed(abs) || (from !== undefined && !this.d.allowed(from))) return { verdict: "protected", reason: "the path is protected", abs, ...(from === undefined ? {} : { from }) };
+		// The forward pass's checks, before any lstat of the path itself: a link among its parents would send the reverse pass outside the project.
+		const canonicalProject = canonicalize(project);
+		const problem = (await this.pathProblem(project, canonicalProject, abs)) ?? (from === undefined ? undefined : await this.pathProblem(project, canonicalProject, from));
+		if (problem !== undefined) return { verdict: "protected", reason: `the path is protected (${problem})`, abs, ...(from === undefined ? {} : { from }) };
 		const out = (verdict: "unchanged" | "act" | "changed", reason?: string, fromAbsent?: boolean) => ({ verdict, ...(reason === undefined ? {} : { reason }), abs, ...(from === undefined ? {} : { from }), ...(fromAbsent ? { fromAbsent } : {}) });
 		const at = async (p: string): Promise<Live> => ((await this.exact(p)) || !caseless ? this.live(p) : { kind: "absent" });
 		switch (row.op) {
@@ -585,7 +595,10 @@ export class Writer {
 		}
 		const tmpRe = new RegExp(`\\.piroboros-tmp-${id}-`, "u");
 		const oldRe = new RegExp(`^\\.(.+)\\.piroboros-old-${id}-\\d+$`, "u");
+		const canonicalProject = canonicalize(project);
 		for (const dir of folders) {
+			const problem = await this.pathProblem(project, canonicalProject, join(dir, "x"));
+			if (problem !== undefined) { lines.push(`left alone: ${dir} (${problem})`); continue; }
 			let names: string[];
 			try { names = await this.d.fs.readdir(dir); } catch { continue; }
 			for (const name of names) {
