@@ -2,6 +2,8 @@
 
 A Windows-first terminal agent harness built around one long-lived chat. Each turn sends a fresh request made from a size-limited view of the chat. A background compactor keeps that view small. A panel of review agents (the Conclave) runs one member at a time, each in its own child conversation.
 
+![A chat turn, a Conclave review and Vesperia's Workspace run merged back into a small project](media/demo.gif)
+
 > Status: early development. The setup wizard, the chat UI, `--print`, `--backup` and the guarded file and shell tools work. The compactor works (`/status` shows its work, its retries and whether it paused after errors). The Conclave pipeline works from the command line of the chat (`/conclave`) and has a side pane. Vesperia's Workspaces and shell confinement work. The memory tools, the `/akashic` commands, the thinking panel and `SKILL.md` skills for the main chat work.
 
 ## Safety

@@ -5,7 +5,7 @@ description: Shared rules for every member of the Conclave, a sequential team of
 
 # The Conclave
 
-The Conclave is a team of eight agents that work on one task, one after another. Each agent answers one question and hands its findings to the next. You are one of them. Your own file says which one.
+The Conclave is a team of eight agents that work on one task, one after another. Each agent answers one question and hands its findings to the next. You are one of them. The role text at the end of your brief says which one.
 
 ## The pipeline
 

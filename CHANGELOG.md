@@ -2,6 +2,15 @@
 
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.4] - 2026-10-29
+
+### Changed
+
+- A Conclave member's request now puts what every member shares first and what differs per seat last, so a provider that caches by prefix can reuse the earlier seats' requests. The developer prompt holds the shared Conclave skill only. The brief is one block for the task, one block per posted report, and a last block with the seat line and the member's own role text (from its file in `agents/`). On three scripted River runs the cached share of all prompt tokens went from 71.3% to 83.6%, and for member requests from 76.8% to 87.9%. A task that started before the upgrade keeps the old layout.
+- On Anthropic models a member brief gets a fourth cache mark, on its last report, so the next seat reads the reports from the cache.
+- A report can no longer open or close a `<role>` block in a brief.
+- The README shows a short recording of a chat turn, a Conclave review and Vesperia's Workspace run merged back.
+
 ## [0.3.3] - 2026-10-28
 
 ### Security

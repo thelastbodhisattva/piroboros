@@ -112,9 +112,6 @@ export function loadDefinitions(root = REPO_ROOT): Definitions {
 	return { agents, skill: skillParts.body };
 }
 
-/** The instructions a member runs with: its own text, then the shared skill. */
-export const instructionsFor = (agent: AgentDef, skill: string): string => `${agent.body}\n\n${skill}`;
-
 /** Find a seat by its name or the first word of its display name, ignoring case. */
 export function findAgent(agents: ReadonlyMap<string, AgentDef>, query: string): AgentDef | undefined {	const key = query.trim().toLowerCase();
 	for (const agent of agents.values()) if (agent.name === key || agent.displayName.split(/\s+/u)[0]!.toLowerCase() === key) return agent;

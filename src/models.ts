@@ -25,9 +25,9 @@ type Block = { type?: string; text?: string; cache_control?: unknown };
 /**
  * Rearrange the cache marks of an Anthropic Messages payload. pi-ai marks the identity block, the system text, the
  * last tool and the last user block. Marks go on the system text (which covers the tools, since tools come first),
- * the last full view block, and the last user block: three of the four allowed. The block that holds the closing
- * `</chat>` stays unmarked, because it changes whenever a line is appended. Does nothing when no mark is present
- * (cache retention off).
+ * the last full view block, and the last user block: three of the four allowed. A Conclave member brief gets the
+ * fourth, on its last report. The block that holds the closing `</chat>` stays unmarked, because it changes whenever a
+ * line is appended. Does nothing when no mark is present (cache retention off).
  */
 export function markCache(payload: unknown): void {
 	const p = payload as { system?: unknown; tools?: unknown; messages?: Array<{ role?: string; content?: unknown }> } | null;
@@ -41,6 +41,9 @@ export function markCache(payload: unknown): void {
 	if (!Array.isArray(content)) return;
 	const tail = (content as Block[]).findIndex((block) => block.type === "text" && typeof block.text === "string" && block.text.endsWith("</chat>"));
 	if (tail > 0) (content as Block[])[tail - 1]!.cache_control = template;
+	// A Conclave member brief ends with the seat's own `<role>` block; the block before it (the last report) is shared with the next seat.
+	const role = (content as Block[]).findIndex((block) => block.type === "text" && typeof block.text === "string" && block.text.includes("\n<role>\n"));
+	if (role > 0) (content as Block[])[role - 1]!.cache_control = template;
 }
 
 /** Wrap a provider so its Anthropic Messages requests go through markCache. Other providers are returned as they are. */
